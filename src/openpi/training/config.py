@@ -773,7 +773,7 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
-    # Fine-tuning Aloha configs.
+    # Fine-tuning configs.
     #
     # Personal Tasks
     TrainConfig(
@@ -815,7 +815,7 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     
-    # [COPILOT]
+    # [COPILOT] pi0 config
     #############################################################################
     TrainConfig(
         name="pi0_align_libero_lora",
@@ -830,7 +830,7 @@ _CONFIGS = [
         vggt_weight_path="./checkpoints/vggt",
         vla_layers_align=12,
         vggt_layers_align=-1,
-        pytorch_training_precision="float32", # [DEBUG]
+        pytorch_training_precision="float16", # [DEBUG]
         pooling_func="bilinear",
         use_vggt_pe=True,
         use_vlm_norm=True,
@@ -846,8 +846,8 @@ _CONFIGS = [
         lora_alpha=16.0,
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        num_train_steps=3000,
-        save_interval=1000,
+        num_train_steps=30000,
+        save_interval=5000,
         batch_size=32,
         ema_decay=None,
         wandb_enabled=True,
@@ -886,7 +886,90 @@ _CONFIGS = [
     ),
     #############################################################################
 
-    #
+
+
+    # [COPILOT] pi05 config
+    #############################################################################
+    TrainConfig(
+        name="pi05_align_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_full_torch",
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,
+        vggt_layers_align=-1,
+        pytorch_training_precision="float16", # [DEBUG]
+        pooling_func="bilinear",
+        use_vggt_pe=True,
+        use_vlm_norm=True,
+        align_loss_coeff=0.5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=30000,
+        save_interval=5000,
+        batch_size=32,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+    
+    # [COPILOT]
+    #############################################################################
+    TrainConfig(
+        name="pi05_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_full_torch",
+        pytorch_training_precision="float16", # [DEBUG]
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=30000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=30000,
+        save_interval=5000,
+        batch_size=32,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+
+
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
     # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(

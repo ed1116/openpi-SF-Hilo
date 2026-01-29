@@ -430,7 +430,7 @@ def train_loop(config: _config.TrainConfig):
         enable_depth=False,
         enable_track=False,
         feature_only=True,
-    ).to(device=device) # [COPILOT][DEBUG] VGGT always in float16: dtype=torch.float16
+    ).to(device=device, dtype=torch.float16) # [COPILOT][DEBUG] VGGT always in float16: dtype=torch.float16
     
     # [COPILOT] VGGT is used as a frozen feature extractor.
     vggt_model.eval()
