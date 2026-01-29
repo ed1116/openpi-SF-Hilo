@@ -411,6 +411,27 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
+    if hasattr(model, "gradient_checkpointing_enable"):
+        enable_gradient_checkpointing = True
+        model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for memory optimization")
+    else:
+        enable_gradient_checkpointing = False
+        logging.info("Gradient checkpointing is not supported for this model")
+
+    # Log initial memory usage after model creation
+    if is_main and torch.cuda.is_available():
+        log_memory_usage(device, 0, "after_model_creation")
+
+    # Enable memory optimizations for large-scale training
+    if world_size >= 8:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Set memory allocation configuration
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        logging.info("Enabled memory optimizations for 8+ GPU training")
+
     # [COPILOT] Apply LoRA if enabled (before DDP wrapping and optimizer creation)
     if config.lora_enabled:
         replaced = apply_lora(
@@ -434,28 +455,7 @@ def train_loop(config: _config.TrainConfig):
             trainable = sum(p.numel() for p in get_trainable_parameters(model))
             total = sum(p.numel() for p in model.parameters())
             logging.info(f"Enabled LoRA: replaced {replaced} Linear layers, trainable params={trainable}/{total}")
-
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
-
-    # Log initial memory usage after model creation
-    if is_main and torch.cuda.is_available():
-        log_memory_usage(device, 0, "after_model_creation")
-
-    # Enable memory optimizations for large-scale training
-    if world_size >= 8:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-        logging.info("Enabled memory optimizations for 8+ GPU training")
-
+    
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,

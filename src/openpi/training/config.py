@@ -908,15 +908,15 @@ _CONFIGS = [
         vggt_weight_path="./checkpoints/vggt",
         vla_layers_align=12,
         vggt_layers_align=-1,
-        pytorch_training_precision="float16", # [DEBUG]
+        pytorch_training_precision="float32", # [DEBUG]
         pooling_func="bilinear",
         use_vggt_pe=True,
         use_vlm_norm=True,
         align_loss_coeff=0.5,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
+            warmup_steps=1_000,
             peak_lr=2.5e-5,
-            decay_steps=30000,
+            decay_steps=20_000,
             decay_lr=2.5e-6,
         ),
         lora_enabled=True,
@@ -924,9 +924,9 @@ _CONFIGS = [
         lora_alpha=16.0,
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        num_train_steps=30000,
+        num_train_steps=20000,
         save_interval=5000,
-        batch_size=32,
+        batch_size=16, # [COPILOT] Gradient accumulation = 2 - > total effective batch size = 32
         ema_decay=None,
         wandb_enabled=True,
     ),
@@ -949,11 +949,11 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_full_torch",
-        pytorch_training_precision="float16", # [DEBUG]
+        pytorch_training_precision="float32", # [DEBUG]
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=2.5e-5,
-            decay_steps=30000,
+            decay_steps=20000,
             decay_lr=2.5e-6,
         ),
         lora_enabled=True,
@@ -961,7 +961,7 @@ _CONFIGS = [
         lora_alpha=16.0,
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        num_train_steps=30000,
+        num_train_steps=20000,
         save_interval=5000,
         batch_size=32,
         ema_decay=None,
