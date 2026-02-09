@@ -11,7 +11,7 @@ logger = logging.getLogger("openpi")
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
-    "right_wrist_0_rgb",
+    # "right_wrist_0_rgb", [COPILOT] Removed right wrist camera
 )
 
 IMAGE_RESOLUTION = (224, 224)
