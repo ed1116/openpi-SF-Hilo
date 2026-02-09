@@ -54,7 +54,7 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
 
         # [COPILOT] Inference in float16. This was bfloat16 in original code.
-        model.paligemma_with_expert.to_bfloat16_for_selected_params("float16")
+        model.paligemma_with_expert.to_bfloat16_for_selected_params("float32")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

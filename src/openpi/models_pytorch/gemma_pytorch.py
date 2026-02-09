@@ -15,7 +15,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config,
         action_expert_config,
         use_adarms=None,
-        precision: Literal["bfloat16", "float16", "float32"] = "bfloat16", # [COPILOT]
+        precision: Literal["bfloat16", "float16", "float32"] = "float32", # [COPILOT]
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -61,7 +61,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.to_bfloat16_for_selected_params(precision)
 
     # [COPILOT]
-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float16", "float32"] = "bfloat16"):
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float16", "float32"] = "float32"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
         elif precision == "float16":

@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+from typing import Optional # [COPILOT] Fixed TypeError
 
 import imageio
 from libero.libero import benchmark
@@ -40,9 +41,18 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos/" + task_suite_name  # Path to save videos
+    # Path to save videos. If None, derived from task_suite_name in __post_init__.
+    video_out_path: Optional[str] = None # [COPILOT] Fixed TypeError
+    # Path to save per-episode log. If None, derived from task_suite_name in __post_init__.
+    log_out_path: Optional[str] = None # [COPILOT] Fixed TypeError
 
     seed: int = 7  # Random Seed (for reproducibility)
+
+    def __post_init__(self) -> None:
+        if self.video_out_path is None:
+            self.video_out_path = f"data/libero/videos/{self.task_suite_name}"
+        if self.log_out_path is None:
+            self.log_out_path = f"data/libero/logs/{self.task_suite_name}.txt"
 
 
 def eval_libero(args: Args) -> None:
@@ -56,6 +66,12 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Task suite: {args.task_suite_name}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    
+    # [COPILOT] Prepare log file
+    pathlib.Path(args.log_out_path).parent.mkdir(parents=True, exist_ok=True)
+
+    log_file = pathlib.Path(args.log_out_path)
+    log_file.write_text("")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -173,6 +189,12 @@ def eval_libero(args: Args) -> None:
                 fps=10,
             )
 
+            # [COPILOT] Log per-episode results
+            with log_file.open("a") as f:
+                f.write(
+                    f"task_id={task_id} episode={episode_idx + 1} result={suffix}\n"
+                )
+
             # Log current results
             logging.info(f"Success: {done}")
             logging.info(f"# episodes completed so far: {total_episodes}")
@@ -184,6 +206,12 @@ def eval_libero(args: Args) -> None:
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    # [COPILOT] Log final results to file
+    with log_file.open("a") as f:
+        f.write(
+            f"total_episodes={total_episodes} total_successes={total_successes} success_rate={float(total_successes) / float(total_episodes):.4f}\n"
+        )
 
 
 def _get_libero_env(task, resolution, seed):
