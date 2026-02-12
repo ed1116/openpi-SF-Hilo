@@ -28,6 +28,8 @@ import gc
 import logging
 import os
 import platform
+import random  # [COPILOT] Save/restore Python RNG state across resume.
+import signal  # [COPILOT] Graceful Ctrl+C checkpoint-on-interrupt handling.
 import shutil
 import time
 
@@ -148,13 +150,42 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def _get_rng_state():
+    # [COPILOT] Capture RNG states so resume can continue with stable stochastic behavior.
+    rng_state = {
+        "torch_cpu": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        rng_state["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+    return rng_state
+
+
+def _set_rng_state(rng_state):
+    # [COPILOT] Restore RNG states from checkpoint (best-effort if some keys are missing).
+    if not rng_state:
+        return
+    if "torch_cpu" in rng_state:
+        torch.set_rng_state(rng_state["torch_cpu"])
+    if "numpy" in rng_state:
+        np.random.set_state(rng_state["numpy"])
+    if "python" in rng_state:
+        random.setstate(rng_state["python"])
+    if torch.cuda.is_available() and "torch_cuda_all" in rng_state:
+        torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, force=False):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
 
-    # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    # [COPILOT] Save on schedule/final-step, or force-save on interrupt.
+    should_save = force or (
+        (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1
+    )
+    if should_save:
         
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
@@ -172,11 +203,15 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
+        # [COPILOT] Save RNG states (torch/cuda/numpy/python) for reproducibility across resume.
+        torch.save(_get_rng_state(), tmp_ckpt_dir / "rng_state.pt")
+
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
             "global_step": global_step,
             "config": dataclasses.asdict(config),
             "timestamp": time.time(),
+            "forced": force,  # [COPILOT] Mark checkpoints created by forced interrupt save.
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
@@ -248,6 +283,16 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
+
+        # [COPILOT] Restore RNG state for torch/cuda/numpy/python.
+        rng_state_path = ckpt_dir / "rng_state.pt"
+        if rng_state_path.exists():
+            rng_state = torch.load(rng_state_path, map_location="cpu", weights_only=False)
+            _set_rng_state(rng_state)
+            del rng_state
+            logging.info("Loaded RNG states from pt format")
+        else:
+            logging.warning("No RNG checkpoint found at %s; stochastic order may diverge after resume", ckpt_dir)
 
         # Load metadata
         logging.info("Loading metadata...")
@@ -537,12 +582,30 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    # [COPILOT] Graceful Ctrl+C: mark stop request, then force-save checkpoint in loop.
+    stop_requested = False
+    _prev_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _copilot_sigint_handler(signum, frame):
+        # [COPILOT] Defer heavy I/O to train loop instead of doing it directly in signal handler.
+        nonlocal stop_requested
+        stop_requested = True
+        logging.warning("SIGINT received. Stopping after current point and saving a forced checkpoint.")
+
+    signal.signal(signal.SIGINT, _copilot_sigint_handler)  # [COPILOT] Install graceful interrupt handler.
+
     while global_step < config.num_train_steps:
+        # [COPILOT] Honor Ctrl+C stop requests at loop boundaries.
+        if stop_requested:
+            break
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
         for observation, actions in loader:
+            # [COPILOT] Honor Ctrl+C stop requests before consuming a new batch.
+            if stop_requested:
+                break
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
@@ -646,6 +709,13 @@ def train_loop(config: _config.TrainConfig):
                 pbar.set_postfix(
                     {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
+
+    # [COPILOT] If stopped by Ctrl+C, force-save current state immediately.
+    if stop_requested:
+        save_checkpoint(model, optim, global_step, config, is_main, data_config, force=True)  # [COPILOT] Forced full-state checkpoint on Ctrl+C.
+
+    # [COPILOT] Restore previous SIGINT handler before teardown.
+    signal.signal(signal.SIGINT, _prev_sigint_handler)  # [COPILOT] Restore previous interrupt handler.
 
     # Close progress bar
     if pbar is not None:

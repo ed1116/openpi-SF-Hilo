@@ -25,7 +25,7 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8001
     resize_size: int = 224
     replan_steps: int = 5
 
