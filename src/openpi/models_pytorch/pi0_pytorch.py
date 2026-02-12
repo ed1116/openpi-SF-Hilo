@@ -158,11 +158,12 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
-    def _preprocess_observation(self, observation, *, train=True):
+    def _preprocess_observation(self, observation, *, train=True, get_wo_aug=False): # [COPILOT] Match with align setup
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train, get_wo_aug=get_wo_aug) # [COPILOT] Match with align setup
         return (
             list(observation.images.values()),
+            list(observation.img_wo_aug.values()) if get_wo_aug else None,  # [COPILOT] Keep align-compatible slot for non-augmented images.
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
@@ -315,7 +316,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+        images, _, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation( # [COPILOT] Refer to line 166
             observation, train=True, get_wo_aug=True # [COPILOT] Match with align setup
         )
 
@@ -382,7 +383,7 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, _, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)  # [COPILOT] Refer to line 166
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
