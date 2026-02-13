@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+import contextlib  # [COPILOT] for optional gradient accumulation
 import dataclasses
 import gc
 import logging
@@ -418,6 +419,19 @@ def train_loop(config: _config.TrainConfig):
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
     effective_batch_size = config.batch_size // world_size
+    # [COPILOT] Optional gradient accumulation via environment variable.
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "1"))
+    grad_accum_debug = os.environ.get("GRAD_ACCUM_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y"}
+    if grad_accum_steps < 1:
+        raise ValueError("GRAD_ACCUM_STEPS must be >= 1")
+    if is_main and grad_accum_steps > 1:
+        logging.info(
+            "Using gradient accumulation: steps=%d (effective global batch=%d)",
+            grad_accum_steps,
+            config.batch_size * grad_accum_steps,
+        )
+    if is_main and grad_accum_debug:
+        logging.info("Grad accumulation debug enabled (GRAD_ACCUM_DEBUG=1)")
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
@@ -616,6 +630,10 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    # [COPILOT] Gradient accumulation variables.
+    accum_step = 0
+    running_loss = 0.0
+
     # [COPILOT] Graceful Ctrl+C: mark stop request, then force-save checkpoint in loop.
     stop_requested = False
     _prev_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -649,22 +667,52 @@ def train_loop(config: _config.TrainConfig):
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+            # [COPILOT] Update LR once per optimizer step (start of accumulation cycle).
+            if accum_step == 0:
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_schedule(global_step)
+                if grad_accum_debug and is_main:
+                    logging.info(
+                        "GradAccum start: global_step=%d micro_step=1/%d lr=%.2e effective_global_batch=%d",
+                        global_step,
+                        grad_accum_steps,
+                        optim.param_groups[0]["lr"],
+                        config.batch_size * grad_accum_steps,
+                    )
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            # [COPILOT] Gradient accumulation context.
+            is_accum_step = (accum_step + 1) % grad_accum_steps != 0
+            no_sync_ctx = contextlib.nullcontext()
+            if use_ddp and is_accum_step:
+                no_sync_ctx = model.no_sync()
 
-            loss = losses.mean()
+            with no_sync_ctx:
+                # Forward pass
+                losses = model(observation, actions)
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            # Backward pass
-            loss.backward()
+                loss = losses.mean()
+
+                # [COPILOT] Backward pass with scaled loss for accumulation.
+                scaled_loss = loss / grad_accum_steps
+                scaled_loss.backward()
+
+            running_loss += loss.item()
+            accum_step += 1
+            if grad_accum_debug and is_main and accum_step < grad_accum_steps:
+                logging.info(
+                    "GradAccum accumulating micro_step=%d/%d (no optimizer step)",
+                    accum_step,
+                    grad_accum_steps,
+                )
+
+            # [COPILOT] Only step optimizer after grad_accum_steps.
+            if accum_step < grad_accum_steps:
+                continue
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
@@ -688,15 +736,17 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
-            # Collect stats
+            # Collect stats (per optimizer step)
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": running_loss / grad_accum_steps,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
                 )
+            running_loss = 0.0
+            accum_step = 0
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
