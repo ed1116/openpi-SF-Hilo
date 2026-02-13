@@ -503,6 +503,9 @@ class TrainConfig:
     lora_dropout: float = 0.05
     lora_target_modules: Sequence[str] | None = None
 
+    # [COPILOT] If true, enable activation/attention gradient checkpointing in PyTorch models.
+    gradient_checkpointing: bool = False
+
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
@@ -927,6 +930,7 @@ _CONFIGS = [
         num_train_steps=20000,
         save_interval=2000,
         batch_size=32, # [COPILOT] Gradient accumulation is off for now
+        gradient_checkpointing=True,
         ema_decay=None,
         wandb_enabled=True,
     ),
@@ -964,6 +968,7 @@ _CONFIGS = [
         num_train_steps=20000,
         save_interval=2000,
         batch_size=32,
+        gradient_checkpointing=True,
         ema_decay=None,
         wandb_enabled=True,
     ),

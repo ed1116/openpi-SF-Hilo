@@ -173,7 +173,26 @@ def _set_rng_state(rng_state):
     if "python" in rng_state:
         random.setstate(rng_state["python"])
     if torch.cuda.is_available() and "torch_cuda_all" in rng_state:
-        torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+        # [COPILOT] Handle checkpoint/runtime CUDA-device-count mismatch (e.g., different WORLD_SIZE or GPU visibility).
+        cuda_states = rng_state["torch_cuda_all"]
+        if isinstance(cuda_states, list | tuple) and len(cuda_states) > 0:
+            current_cuda_count = len(torch.cuda.default_generators)
+            if len(cuda_states) == current_cuda_count:
+                torch.cuda.set_rng_state_all(cuda_states)
+            else:
+                # [COPILOT] Fallback: restore only the current CUDA device state to avoid IndexError.
+                current_device = torch.cuda.current_device()
+                safe_idx = min(current_device, len(cuda_states) - 1)
+                torch.cuda.set_rng_state(cuda_states[safe_idx], device=current_device)
+                logging.warning(
+                    "CUDA RNG state count mismatch (ckpt=%d, runtime=%d). Restored only device %d using state index %d.",
+                    len(cuda_states),
+                    current_cuda_count,
+                    current_device,
+                    safe_idx,
+                )
+        else:
+            logging.warning("Invalid or empty torch_cuda_all RNG payload; skipping CUDA RNG restore.")
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, force=False):
@@ -456,13 +475,28 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
+    # [COPILOT] Switch gradient checkpointing from TrainConfig/CLI flag.
+    if config.gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            enable_gradient_checkpointing = True
+            model.gradient_checkpointing_enable()
+            logging.info("Enabled gradient checkpointing via config/CLI flag")
+        else:
+            enable_gradient_checkpointing = False
+            logging.warning(
+                "Requested gradient checkpointing, but model does not support it. Continuing with checkpointing disabled."
+            )
     else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        if hasattr(model, "gradient_checkpointing_disable"):
+            enable_gradient_checkpointing = False
+            model.gradient_checkpointing_disable()
+            logging.info("Gradient checkpointing disabled (default)")
+        elif hasattr(model, "gradient_checkpointing_enable"):
+            enable_gradient_checkpointing = False
+            logging.info("Gradient checkpointing is supported, but disabled by config")
+        else:
+            enable_gradient_checkpointing = False
+            logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():

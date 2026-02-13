@@ -138,12 +138,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
+            # [COPILOT] Keep this disabled for throughput-focused runs; preserve old logic as comments.
             # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
+            # if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
+            #     if not self.gemma_expert.model.gradient_checkpointing:
+            #         print("Forcing gradient checkpointing to be enabled for Gemma expert model")
+            #         self.gemma_expert.model.gradient_checkpointing = True
+            #     use_gradient_checkpointing = True
 
             # Debug gradient checkpointing status
             if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
