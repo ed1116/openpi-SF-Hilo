@@ -485,6 +485,19 @@ class TrainConfig:
     use_vlm_norm: bool | None = None
 
     align_loss_coeff: float = 0.0
+    taskaware_loss_coeff: float = 1.0  # [COPILOT] Coefficient for task-aware auxiliary loss: ITC + ITM + LM.
+    # [COPILOT] Task-aware Q-Former options for VGGT-to-VLM alignment.
+    taskaware_text_layer: int | None = None
+    taskaware_text_detach: bool = True
+    taskaware_text_dropout: float = 0.1
+    taskaware_query_side: int = 16
+    taskaware_qformer_dim: int = 768  # [COPILOT] Shared hidden size for task-aware queries/text inside Q-Former.
+    taskaware_qformer_layers: int = 4
+    taskaware_qformer_heads: int = 8
+    taskaware_qformer_mlp_ratio: float = 4.0
+    taskaware_qformer_dropout: float = 0.0
+    taskaware_qformer_cross_attention_freq: int = 2  # [COPILOT] BLIP-2 style cross-attention cadence (every N layers).
+    taskaware_align_mlp_hidden: int = 1024  # [COPILOT] Hidden size for 2-layer MLP: Q-Former(768)->hidden->VLM(2048).
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "float32"
@@ -889,7 +902,61 @@ _CONFIGS = [
     ),
     #############################################################################
 
-
+# [COPILOT] pi05 task-aware config (Q-Former-based VGGT alignment).
+    #############################################################################
+    TrainConfig(
+        name="pi05_taskaware_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_full_torch",
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,  # [COPILOT] Align target uses (k+1)-th VLM image tokens.
+        vggt_layers_align=-1,
+        taskaware_text_layer=11,  # [COPILOT] Q-Former text conditioning uses k-th VLM text tokens.
+        taskaware_text_detach=True,
+        taskaware_text_dropout=0.1,
+        taskaware_query_side=16,  # [COPILOT] 16x16 learnable queries per view.
+        taskaware_qformer_dim=768,  # [COPILOT] Keep task-aware Q-Former in BLIP-2-style 768-dim space.
+        taskaware_qformer_layers=2,  # [COPILOT] PoC speed setting: use a smaller 2-block TaskAware Q-Former.
+        taskaware_qformer_heads=8,
+        taskaware_qformer_mlp_ratio=4.0,
+        taskaware_qformer_dropout=0.0,
+        taskaware_qformer_cross_attention_freq=1,  # [COPILOT] PoC apply query-VGGT cross-attention every layer.
+        taskaware_align_mlp_hidden=1024,  # [COPILOT] Use 2-layer alignment MLP: 768 -> 1024 -> 2048.
+        pytorch_training_precision="float32", # [DEBUG]
+        # pooling_func="bilinear",  # [COPILOT] Kept for compatibility; task-aware model does not use bilinear pooling.
+        use_vggt_pe=True,  # [COPILOT] Kept for compatibility with existing config interfaces.
+        use_vlm_norm=True,
+        align_loss_coeff=0.5,
+        taskaware_loss_coeff=0.05, # [COPILOT] 1 * (ITC + ITM + LM)
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=20000,
+        save_interval=2000,
+        batch_size=8, # [COPILOT] Gradient accumulation is 4.
+        gradient_checkpointing=True,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
 
     # [COPILOT] pi05 config
     #############################################################################

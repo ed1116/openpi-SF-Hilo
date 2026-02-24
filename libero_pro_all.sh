@@ -9,7 +9,7 @@ CONFIG_PATH="${ROOT_DIR}/third_party/LIBERO-PRO/evaluation_config.yaml"
 MAIN_PY="${ROOT_DIR}/examples/libero-pro/main.py"
 
 #[COPILOT] Runtime knobs (override via env vars when needed).
-PY_BIN="${PY_BIN:-python}"
+PY_BIN="${PY_BIN:-${ROOT_DIR}/examples/libero-pro/.venv-pro/bin/python}" #[COPILOT] Prefer libero-pro venv interpreter by default.
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
 NUM_TRIALS="${NUM_TRIALS:-10}"
@@ -20,6 +20,12 @@ SEED="${SEED:-7}"
 VIDEO_ROOT="${VIDEO_ROOT:-${ROOT_DIR}/data/libero-pro/videos}"
 LOG_ROOT="${LOG_ROOT:-${ROOT_DIR}/data/libero-pro/logs}"
 DRY_RUN="${DRY_RUN:-0}"
+#[COPILOT] Resume support: 1-based run index (1=libero_spatial base, 2=libero_spatial swap, ...).
+START_RUN_IDX="${START_RUN_IDX:-1}"
+
+#[COPILOT] Ensure LIBERO-PRO benchmark package is imported first so *_temp/*_swap suites are registered.
+export PYTHONPATH="${ROOT_DIR}/third_party/LIBERO-PRO:${PYTHONPATH:-}"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${ROOT_DIR}/third_party/LIBERO-PRO/.libero}" #[COPILOT] Use LIBERO-PRO-specific LIBERO config directory.
 
 mkdir -p "${VIDEO_ROOT}" "${LOG_ROOT}"
 
@@ -110,6 +116,12 @@ for base_suite in "${BASE_SUITES[@]}"; do
     esac
 
     RUN_IDX=$((RUN_IDX + 1))
+    #[COPILOT] Skip already-finished runs before START_RUN_IDX.
+    if (( RUN_IDX < START_RUN_IDX )); then
+      echo "[SKIP ${RUN_IDX}/${TOTAL_RUNS}] base=${base_suite} mode=${mode}"
+      continue
+    fi
+
     video_path="${VIDEO_ROOT}/${suite_tag}"
     log_path="${LOG_ROOT}/${suite_tag}.txt"
     mkdir -p "${video_path}"

@@ -3,7 +3,7 @@ script_path: ./notebooks/generate_init_states.py
 init_file_dir: ./libero/libero/init_files/
 use_environment: false
 use_swap: false
-use_object: false
+use_object: true
 use_language: false
 use_task: false
 ood_task_configs:
