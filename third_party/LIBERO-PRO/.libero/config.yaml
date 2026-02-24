@@ -1,0 +1,5 @@
+assets: /home/ed1116/Projects/Spatial-Forcing/openpi-SF/third_party/LIBERO-PRO/libero/libero/assets
+bddl_files: /home/ed1116/Projects/Spatial-Forcing/openpi-SF/third_party/LIBERO-PRO/libero/libero/bddl_files
+benchmark_root: /home/ed1116/Projects/Spatial-Forcing/openpi-SF/third_party/LIBERO-PRO/libero/libero
+datasets: /media/hdd1/ed1116/Datasets/libero
+init_states: /home/ed1116/Projects/Spatial-Forcing/openpi-SF/third_party/LIBERO-PRO/libero/libero/init_files
