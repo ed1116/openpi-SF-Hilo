@@ -12,14 +12,19 @@ class AlignProjector(nn.Module):
             llm_dim: int, 
             vggt_dim: int,
             use_vlm_norm: bool = False,
+            hidden_dim: int | None = None,
+            out_dim: int | None = None,
         ) -> None:
         super().__init__()
 
         self.llm_dim = llm_dim
         self.vggt_dim = vggt_dim
+        # [COPILOT] Keep backward-compatible defaults: align configs still use 2*vggt_dim unless overridden.
+        self.hidden_dim = hidden_dim if hidden_dim is not None else 2 * self.vggt_dim
+        self.out_dim = out_dim if out_dim is not None else 2 * self.vggt_dim
 
-        self.fc1 = nn.Linear(self.llm_dim, 2 * self.vggt_dim, bias=True)
-        self.fc2 = nn.Linear(2 * self.vggt_dim, 2 * self.vggt_dim, bias=True)
+        self.fc1 = nn.Linear(self.llm_dim, self.hidden_dim, bias=True)
+        self.fc2 = nn.Linear(self.hidden_dim, self.out_dim, bias=True)
         self.act_fn1 = nn.GELU()
         
         self.vlm_norm = nn.LayerNorm(llm_dim) if use_vlm_norm else None

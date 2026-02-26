@@ -483,9 +483,33 @@ class TrainConfig:
     pooling_func: str | None = None
     use_vggt_pe: bool | None = None
     use_vlm_norm: bool | None = None
+    # [COPILOT] Optional shared AlignProjector width overrides; defaults keep legacy align behavior.
+    align_projector_hidden_dim: int | None = None
+    align_projector_out_dim: int | None = None
 
     align_loss_coeff: float = 0.0
-    taskaware_loss_coeff: float = 1.0  # [COPILOT] Coefficient for task-aware auxiliary loss: ITC + ITM + LM.
+    taskaware_loss_coeff: float = 1.0  # [COPILOT] Coefficient for task-aware auxiliary loss: ITC + ITM.
+    # [COPILOT] Optional 3-stage task-aware schedule (PyTorch train_taskaware_pytorch).
+    # Stage 1: task-aware only, Stage 2: action+align only, Stage 3: joint finetune.
+    taskaware_stage1_steps: int | None = None
+    taskaware_stage2_steps: int | None = None
+    taskaware_stage3_steps: int | None = None
+    taskaware_stage1_task_loss_coeff: float = 1.0
+    taskaware_stage3_task_loss_coeff: float | None = None
+    # [COPILOT] Optional stage-specific runtime knobs for train_taskaware_pytorch.
+    # Stage 1 and Stage 2/3 can use different batch size / grad accumulation / LR schedule.
+    taskaware_stage1_batch_size: int | None = None
+    taskaware_stage23_batch_size: int | None = None
+    taskaware_stage1_grad_accum_steps: int | None = None
+    taskaware_stage23_grad_accum_steps: int | None = None
+    taskaware_stage1_lr_warmup_steps: int | None = None
+    taskaware_stage1_lr_peak: float | None = None
+    taskaware_stage1_lr_decay_steps: int | None = None
+    taskaware_stage1_lr_decay_lr: float | None = None
+    taskaware_stage23_lr_warmup_steps: int | None = None
+    taskaware_stage23_lr_peak: float | None = None
+    taskaware_stage23_lr_decay_steps: int | None = None
+    taskaware_stage23_lr_decay_lr: float | None = None
     # [COPILOT] Task-aware Q-Former options for VGGT-to-VLM alignment.
     taskaware_text_layer: int | None = None
     taskaware_text_detach: bool = True
@@ -497,7 +521,6 @@ class TrainConfig:
     taskaware_qformer_mlp_ratio: float = 4.0
     taskaware_qformer_dropout: float = 0.0
     taskaware_qformer_cross_attention_freq: int = 2  # [COPILOT] BLIP-2 style cross-attention cadence (every N layers).
-    taskaware_align_mlp_hidden: int = 1024  # [COPILOT] Hidden size for 2-layer MLP: Q-Former(768)->hidden->VLM(2048).
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "float32"
@@ -921,6 +944,7 @@ _CONFIGS = [
         vggt_weight_path="./checkpoints/vggt",
         vla_layers_align=12,  # [COPILOT] Align target uses (k+1)-th VLM image tokens.
         vggt_layers_align=-1,
+        
         taskaware_text_layer=11,  # [COPILOT] Q-Former text conditioning uses k-th VLM text tokens.
         taskaware_text_detach=True,
         taskaware_text_dropout=0.1,
@@ -931,27 +955,50 @@ _CONFIGS = [
         taskaware_qformer_mlp_ratio=4.0,
         taskaware_qformer_dropout=0.0,
         taskaware_qformer_cross_attention_freq=1,  # [COPILOT] PoC apply query-VGGT cross-attention every layer.
-        taskaware_align_mlp_hidden=1024,  # [COPILOT] Use 2-layer alignment MLP: 768 -> 1024 -> 2048.
+        
+        align_projector_hidden_dim=1024,  # [COPILOT] Task-aware VLM projection: 2048 -> 1024 -> 768.
+        align_projector_out_dim=768,  # [COPILOT] Match projector output to raw Q-Former output for cosine alignment.
+        
         pytorch_training_precision="float32", # [DEBUG]
-        # pooling_func="bilinear",  # [COPILOT] Kept for compatibility; task-aware model does not use bilinear pooling.
-        use_vggt_pe=True,  # [COPILOT] Kept for compatibility with existing config interfaces.
+        
+        # [COPILOT] task-aware model does not use bilinear pooling.
+        # use_vggt_pe=True,  # [COPILOT] VGGT already has RoPE positional embeddings. This was only additional PE for pooling.
         use_vlm_norm=True,
         align_loss_coeff=0.5,
-        taskaware_loss_coeff=0.05, # [COPILOT] 1 * (ITC + ITM + LM)
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=20_000,
-            decay_lr=2.5e-6,
-        ),
+        taskaware_stage1_steps=3_000, # [COPILOT] Stage 1: task-aware only.
+        taskaware_stage2_steps=6_000, # [COPILOT] Stage 2: action + align only.
+        taskaware_stage3_steps=11_000, # [COPILOT] Stage 3: action + align + task-aware.
+        taskaware_stage1_task_loss_coeff=1.0, # [COPILOT] Unscaled task loss in stage 1.
+        taskaware_stage3_task_loss_coeff=0.05, # [COPILOT] Stage 3 task loss coefficient.
+        
+        taskaware_stage1_batch_size=16, # [COPILOT] Stage 1 global batch size.
+        taskaware_stage23_batch_size=16, # [COPILOT] Stage 2/3 global batch size.
+        taskaware_stage1_grad_accum_steps=2, # [COPILOT] Stage 1 gradient accumulation.
+        taskaware_stage23_grad_accum_steps=2, # [COPILOT] Stage 2/3 gradient accumulation.
+        
+        taskaware_stage1_lr_warmup_steps=300, # [COPILOT] Stage 1 LR schedule.
+        taskaware_stage1_lr_peak=5e-6,
+        taskaware_stage1_lr_decay_steps=3_000,
+        taskaware_stage1_lr_decay_lr=5e-7,
+        taskaware_stage23_lr_warmup_steps=1_000, # [COPILOT] Stage 2/3 LR schedule.
+        taskaware_stage23_lr_peak=2.5e-5,
+        taskaware_stage23_lr_decay_steps=17_000,
+        taskaware_stage23_lr_decay_lr=2.5e-6,
+
+        # lr_schedule=_optimizer.CosineDecaySchedule(
+        #     warmup_steps=1_000,
+        #     peak_lr=2.5e-5,
+        #     decay_steps=20_000,
+        #     decay_lr=2.5e-6,
+        # ),
+
         lora_enabled=True,
         lora_rank=8,
         lora_alpha=16.0,
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         num_train_steps=20000,
-        save_interval=2000,
-        batch_size=8, # [COPILOT] Gradient accumulation is 4.
+        save_interval=1000,
         gradient_checkpointing=True,
         ema_decay=None,
         wandb_enabled=True,

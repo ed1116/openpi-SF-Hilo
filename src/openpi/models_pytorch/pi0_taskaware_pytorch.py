@@ -271,8 +271,7 @@ class PI0Pytorch(nn.Module):
         # Specific config for SpatialForcing alignment
         self.vla_layers_align = extra_config.vla_layers_align
         self.vggt_layers_align = extra_config.vggt_layers_align
-        self.pooling_func = extra_config.pooling_func
-        self.use_vggt_pe = extra_config.use_vggt_pe
+
         # [COPILOT] Task-aware alignment config: text-conditioned Q-Former over VGGT tokens.
         self.taskaware_text_layer = getattr(extra_config, "taskaware_text_layer", None)
         if self.taskaware_text_layer is None:
@@ -286,16 +285,17 @@ class PI0Pytorch(nn.Module):
         self.taskaware_qformer_cross_attention_freq = max(
             1, int(getattr(extra_config, "taskaware_qformer_cross_attention_freq", 2))
         )
-        # [COPILOT] Keep Q-Former query/text space at 768 and bridge to/from VLM 2048 with explicit projectors.
+        # [COPILOT] Keep Q-Former query/text space at 768 and only project VLM text into that space.
         self.taskaware_qformer_dim = int(getattr(extra_config, "taskaware_qformer_dim", 768))
-        self.taskaware_align_mlp_hidden = int(getattr(extra_config, "taskaware_align_mlp_hidden", 1024))
+        self.taskaware_qformer_heads = int(getattr(extra_config, "taskaware_qformer_heads", 8))
+        self.taskaware_qformer_dropout = float(getattr(extra_config, "taskaware_qformer_dropout", 0.0))
         self.taskaware_qformer = TaskAwareQFormer(
             hidden_dim=self.taskaware_qformer_dim,
             encoder_dim=self.LLM_width,
-            num_heads=int(getattr(extra_config, "taskaware_qformer_heads", 8)),
+            num_heads=self.taskaware_qformer_heads,
             num_layers=int(getattr(extra_config, "taskaware_qformer_layers", 4)),
             mlp_ratio=float(getattr(extra_config, "taskaware_qformer_mlp_ratio", 4.0)),
-            dropout=float(getattr(extra_config, "taskaware_qformer_dropout", 0.0)),
+            dropout=self.taskaware_qformer_dropout,
             cross_attention_freq=self.taskaware_qformer_cross_attention_freq,
         )
         # [COPILOT] Single-layer MLP projection: VLM text hidden (2048) -> Q-Former text input (768).
@@ -307,15 +307,16 @@ class PI0Pytorch(nn.Module):
         self.taskaware_query_pos = nn.Parameter(torch.zeros(1, self.taskaware_queries_per_view, self.taskaware_qformer_dim))
         nn.init.normal_(self.taskaware_query_tokens, std=0.02)
         nn.init.normal_(self.taskaware_query_pos, std=0.02)
-        # [COPILOT] Two-layer MLP projection: Q-Former output (768) -> aligned feature (2048) for cosine alignment.
-        self.taskaware_align_proj = nn.Sequential(
-            nn.Linear(self.taskaware_qformer_dim, self.taskaware_align_mlp_hidden),
-            nn.GELU(),
-            nn.Linear(self.taskaware_align_mlp_hidden, self.LLM_width),
-        )
         # [COPILOT] BLIP-2 style auxiliary heads for task-aware ITC/ITM/LM objectives.
         self.taskaware_vision_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_qformer_dim)
         self.taskaware_text_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_qformer_dim)
+        self.taskaware_itm_cross_attn = nn.MultiheadAttention(
+            self.taskaware_qformer_dim,
+            self.taskaware_qformer_heads,
+            dropout=self.taskaware_qformer_dropout,
+            batch_first=True,
+        )
+        self.taskaware_itm_norm = nn.LayerNorm(self.taskaware_qformer_dim)
         self.taskaware_itm_head = nn.Linear(self.taskaware_qformer_dim, 2)
         self.taskaware_temp = nn.Parameter(torch.tensor(0.07))
 
@@ -349,6 +350,32 @@ class PI0Pytorch(nn.Module):
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
+
+    def set_trainable_for_stage(self, stage: int, *, lora_enabled: bool) -> None:
+        """Configure trainable parameter groups for 3-stage training."""
+        if stage not in (1, 2, 3):
+            raise ValueError(f"Unsupported stage={stage}. Expected one of (1, 2, 3).")
+
+        # Start from full freeze, then selectively unfreeze trainable groups per stage.
+        for _, param in self.named_parameters():
+            param.requires_grad = False
+
+        # Stage 1 + 3: task-aware blocks full fine-tuning.
+        if stage in (1, 3):
+            for name, param in self.named_parameters():
+                if name.startswith("taskaware_"):
+                    param.requires_grad = True
+
+        # Stage 2 + 3: LoRA updates on VLM backbone/action expert, excluding vision tower.
+        if stage in (2, 3):
+            if not lora_enabled:
+                raise ValueError(
+                    "Stage 2/3 requires LoRA-enabled training for VLM backbone/action expert adapters."
+                )
+            vision_tower_prefix = "paligemma_with_expert.paligemma.vision_tower"
+            for name, param in self.named_parameters():
+                if ("lora_A" in name or "lora_B" in name) and not name.startswith(vision_tower_prefix):
+                    param.requires_grad = True
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -583,7 +610,7 @@ class PI0Pytorch(nn.Module):
         return query_outputs.reshape(bsz, num_views * self.taskaware_queries_per_view, self.taskaware_qformer_dim)
 
     def _taskaware_pool_text(self, text_hidden: torch.Tensor | None, text_mask: torch.Tensor | None) -> torch.Tensor:
-        # [COPILOT] Mask-aware text pooling used by ITC/ITM objectives.
+        # [COPILOT] Mask-aware text pooling used by ITC objective.
         if text_hidden is None or text_hidden.shape[1] == 0:
             return self.taskaware_query_tokens.new_zeros((1, self.taskaware_qformer_dim))
         if text_mask is None:
@@ -640,13 +667,45 @@ class PI0Pytorch(nn.Module):
             neg_text_idx = torch.multinomial(weights_i2t, 1).squeeze(1)
             neg_img_idx = torch.multinomial(weights_t2i, 1).squeeze(1)
 
-        def _itm_logits(image_tokens: torch.Tensor, txt_feat: torch.Tensor) -> torch.Tensor:
-            fused = image_tokens + txt_feat[:, None, :]
+        def _itm_logits(
+            image_tokens: torch.Tensor,
+            text_tokens: torch.Tensor | None,
+            text_tokens_mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            if text_tokens is None or text_tokens.shape[1] == 0:
+                fused = image_tokens
+            else:
+                text_tokens = text_tokens.to(dtype=image_tokens.dtype)
+                if text_tokens_mask is None:
+                    valid_mask = torch.ones(
+                        text_tokens.shape[0],
+                        text_tokens.shape[1],
+                        dtype=torch.bool,
+                        device=text_tokens.device,
+                    )
+                else:
+                    valid_mask = text_tokens_mask.bool()
+                key_padding_mask = ~valid_mask
+                itm_cross, _ = self.taskaware_itm_cross_attn(
+                    image_tokens,
+                    text_tokens,
+                    text_tokens,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                fused = self.taskaware_itm_norm(image_tokens + itm_cross)
             return self.taskaware_itm_head(fused).mean(dim=1)
 
-        logits_pos = _itm_logits(taskaware_hidden, text_feat)
-        logits_neg_img = _itm_logits(taskaware_hidden[neg_img_idx], text_feat)
-        logits_neg_text = _itm_logits(taskaware_hidden, text_feat[neg_text_idx])
+        if text_hidden is not None:
+            neg_text_hidden = text_hidden[neg_text_idx]
+            neg_text_mask = text_mask[neg_text_idx] if text_mask is not None else None
+        else:
+            neg_text_hidden = None
+            neg_text_mask = None
+
+        logits_pos = _itm_logits(taskaware_hidden, text_hidden, text_mask)
+        logits_neg_img = _itm_logits(taskaware_hidden[neg_img_idx], text_hidden, text_mask)
+        logits_neg_text = _itm_logits(taskaware_hidden, neg_text_hidden, neg_text_mask)
         itm_logits = torch.cat([logits_pos, logits_neg_img, logits_neg_text], dim=0)
         itm_labels = torch.cat(
             [
@@ -665,31 +724,32 @@ class PI0Pytorch(nn.Module):
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
     ) -> torch.Tensor:
-        # [COPILOT] Language-model loss on text segment (next-token prediction) to match LM auxiliary objective.
-        if lang_tokens.shape[1] < 2:
-            return lang_tokens.new_zeros((), dtype=torch.float32)
-
-        (prefix_hidden_final, _) = all_hidden_states[-1]
-        text_hidden_final = prefix_hidden_final[:, img_len:, :]
-        text_hidden_final = text_hidden_final[:, : lang_tokens.shape[1], :]
-
-        lm_head = self.paligemma_with_expert.paligemma.lm_head
-        logits = lm_head(text_hidden_final.to(dtype=lm_head.weight.dtype)).to(dtype=torch.float32)
-        shift_logits = logits[:, :-1, :]
-        shift_labels = lang_tokens[:, 1:].to(dtype=torch.long)
-        shift_mask = lang_masks[:, 1:].bool()
-
-        if not torch.any(shift_mask):
-            return logits.new_zeros(())
-
-        token_loss = F.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.shape[-1]),
-            shift_labels.reshape(-1),
-            reduction="none",
-            label_smoothing=0.1,
-        ).view_as(shift_labels)
-        shift_mask_f = shift_mask.to(dtype=token_loss.dtype)
-        return (token_loss * shift_mask_f).sum() / shift_mask_f.sum().clamp_min(1.0)
+        # [COPILOT][EXCLUDE] LM/ITG path disabled.
+        # if lang_tokens.shape[1] < 2:
+        #     return lang_tokens.new_zeros((), dtype=torch.float32)
+        #
+        # (prefix_hidden_final, _) = all_hidden_states[-1]
+        # text_hidden_final = prefix_hidden_final[:, img_len:, :]
+        # text_hidden_final = text_hidden_final[:, : lang_tokens.shape[1], :]
+        #
+        # lm_head = self.paligemma_with_expert.paligemma.lm_head
+        # logits = lm_head(text_hidden_final.to(dtype=lm_head.weight.dtype)).to(dtype=torch.float32)
+        # shift_logits = logits[:, :-1, :]
+        # shift_labels = lang_tokens[:, 1:].to(dtype=torch.long)
+        # shift_mask = lang_masks[:, 1:].bool()
+        #
+        # if not torch.any(shift_mask):
+        #     return logits.new_zeros(())
+        #
+        # token_loss = F.cross_entropy(
+        #     shift_logits.reshape(-1, shift_logits.shape[-1]),
+        #     shift_labels.reshape(-1),
+        #     reduction="none",
+        #     label_smoothing=0.1,
+        # ).view_as(shift_labels)
+        # shift_mask_f = shift_mask.to(dtype=token_loss.dtype)
+        # return (token_loss * shift_mask_f).sum() / shift_mask_f.sum().clamp_min(1.0)
+        return lang_tokens.new_zeros((), dtype=torch.float32)
 
     def forward(self, observation, actions, vggt, align_proj, noise=None, time=None) -> tuple[Tensor, Tensor, Tensor]:
         """Do a full training forward pass and return (action_loss, align_loss, taskaware_aux_loss)."""
@@ -775,16 +835,15 @@ class PI0Pytorch(nn.Module):
 
         # [COPILOT] Replace bilinear pooling with task-aware Q-Former compression into 16x16=256 queries per view.
         taskaware_hidden = self._taskaware_query_tokens(vggt_hidden, text_hidden, text_mask)
-        # [COPILOT] Convert Q-Former query outputs (768) to alignment target space (2048) before cosine loss.
-        taskaware_aligned_hidden = self.taskaware_align_proj(taskaware_hidden)
 
-        if taskaware_aligned_hidden.shape[:2] != vision_hidden.shape[:2]:
+        # [COPILOT] Compare raw Q-Former outputs directly against projected VLM vision features.
+        if taskaware_hidden.shape[:2] != vision_hidden.shape[:2]:
             raise ValueError(
-                f"Task-aware aligned shape {taskaware_aligned_hidden.shape} does not match vision hidden {vision_hidden.shape}."
+                f"Task-aware hidden shape {taskaware_hidden.shape} does not match vision hidden {vision_hidden.shape}."
             )
 
         # [COPILOT] Empty-image feature masks for alignment loss.
-        tokens_per_img = taskaware_aligned_hidden.shape[1] // len(images)
+        tokens_per_img = taskaware_hidden.shape[1] // len(images)
         img_masks_stack = torch.stack(img_masks, dim=1)
         align_mask = torch.repeat_interleave(img_masks_stack, repeats=tokens_per_img, dim=1)
 
@@ -802,12 +861,13 @@ class PI0Pytorch(nn.Module):
 
         # [COPILOT] Project VLM hidden states and compute cosine alignment loss against task-aware VGGT queries.
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            align_loss = align_proj(vision_hidden, taskaware_aligned_hidden, align_mask)
+            align_loss = align_proj(vision_hidden, taskaware_hidden, align_mask)
 
-        # [COPILOT] Task-aware auxiliary objective: ITC + ITM + LM.
+        # [COPILOT][EXCLUDE] LM/ITG objective disabled; use only ITC + ITM.
         loss_itc, loss_itm = self._taskaware_itc_itm_losses(taskaware_hidden, text_hidden, text_mask)
-        loss_lm = self._taskaware_lm_loss(all_hidden_states, img_len, lang_tokens, lang_masks)
-        taskaware_aux_loss = loss_itc + loss_itm + loss_lm
+        # loss_lm = self._taskaware_lm_loss(all_hidden_states, img_len, lang_tokens, lang_masks)
+        # taskaware_aux_loss = loss_itc + loss_itm + loss_lm
+        taskaware_aux_loss = loss_itc + loss_itm
 
         return action_loss, align_loss, taskaware_aux_loss
 
