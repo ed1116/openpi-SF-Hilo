@@ -332,11 +332,16 @@ class PI0Pytorch(nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        # [COPILOT] Avoid nested checkpoint stacks (submodule checkpoint + outer _apply_checkpoint),
+        # which can trigger DDP "Expected to mark a variable ready only once" during stage transitions.
+        # Keep submodule-level checkpointing off and use only the outer wrapper path.
+        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        logging.info(
+            "Enabled gradient checkpointing for PI0Pytorch model (outer checkpoint wrapper only)"
+        )
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""

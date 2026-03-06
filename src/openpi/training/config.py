@@ -972,9 +972,9 @@ _CONFIGS = [
         taskaware_stage3_task_loss_coeff=0.05, # [COPILOT] Stage 3 task loss coefficient.
         
         taskaware_stage1_batch_size=16, # [COPILOT] Stage 1 global batch size.
-        taskaware_stage23_batch_size=16, # [COPILOT] Stage 2/3 global batch size.
+        taskaware_stage23_batch_size=8, # [COPILOT] Stage 2/3 global batch size.
         taskaware_stage1_grad_accum_steps=2, # [COPILOT] Stage 1 gradient accumulation.
-        taskaware_stage23_grad_accum_steps=2, # [COPILOT] Stage 2/3 gradient accumulation.
+        taskaware_stage23_grad_accum_steps=4, # [COPILOT] Stage 2/3 gradient accumulation.
         
         taskaware_stage1_lr_warmup_steps=300, # [COPILOT] Stage 1 LR schedule.
         taskaware_stage1_lr_peak=5e-6,

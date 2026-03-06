@@ -259,7 +259,16 @@ class BaseModelConfig(abc.ABC):
                 target_modules=train_config.lora_target_modules,
             )
 
-        safetensors.torch.load_model(model, weight_path)
+        # safetensors.torch.load_model(model, weight_path)
+
+        # [COPILOT] Use strict=False to tolerate auxiliary task-aware (taskaware_*) keys
+        # that exist in checkpoints trained with pi0_taskaware_pytorch but are not needed
+        # for inference with the base PI0Pytorch model.
+        missing, unexpected = safetensors.torch.load_model(model, weight_path, strict=False)
+        if unexpected:
+            logger.info("Ignored %d unexpected keys in checkpoint (e.g. %s)", len(unexpected), unexpected[:3])
+        if missing:
+            logger.warning("Missing %d keys when loading checkpoint: %s", len(missing), missing[:5])
         return model
 
     @abc.abstractmethod
