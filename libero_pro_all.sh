@@ -2,7 +2,7 @@
 set -euo pipefail
 
 #[COPILOT] Sweep script for 20 LIBERO-PRO evaluations:
-#[COPILOT] 4 base suites x (base + swap + object + language + task).
+#[COPILOT] 4 main suites x (base + swap + object + language + task).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_PATH="${ROOT_DIR}/third_party/LIBERO-PRO/evaluation_config.yaml"
