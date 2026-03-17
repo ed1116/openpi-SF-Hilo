@@ -45,7 +45,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
-from openpi.models_pytorch import pi0_pytorch, pi0_taskaware_pytorch, projectors  # [COPILOT] Use task-aware model.
+from openpi.models_pytorch import pi0_attn_pytorch, pi0_pytorch, projectors  # [COPILOT] Use attention/Q-Former model.
 from openpi.models_pytorch.lora_copilot import apply_lora, get_trainable_parameters, mark_only_lora_as_trainable # [COPILOT]
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -535,7 +535,29 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_taskaware_pytorch.PI0Pytorch(model_cfg, config).to(device)  # [COPILOT] Task-aware alignment model.
+    # [COPILOT] Train-attn-only override: force pi05 language token budget to 48 for memory/runtime control.
+    if getattr(model_cfg, "pi05", False):
+        object.__setattr__(model_cfg, "max_token_len", 48)
+        # [COPILOT] Enforce BLIP-2-aligned task-aware hyperparameters for stable pretrained weight reuse.
+        _blip2_aligned_overrides = {
+            "taskaware_qformer_dim": 768,
+            "taskaware_qformer_heads": 12,
+            "taskaware_qformer_dropout": 0.1,
+            "taskaware_qformer_cross_attention_freq": 2,
+            "taskaware_itc_dim": 256,
+        }
+        for _key, _value in _blip2_aligned_overrides.items():
+            _current = getattr(config, _key, None)
+            if _current != _value:
+                logging.info(
+                    "[COPILOT] Overriding %s from %s to %s for BLIP-2 pretrained alignment.",
+                    _key,
+                    _current,
+                    _value,
+                )
+                object.__setattr__(config, _key, _value)
+
+    model = openpi.models_pytorch.pi0_attn_pytorch.PI0Pytorch(model_cfg, config).to(device)  # [COPILOT] Attention/Q-Former alignment model.
     vggt_model = VGGT(
         enable_camera=False,
         enable_point=False,
@@ -603,9 +625,9 @@ def train_loop(config: _config.TrainConfig):
             target_modules=config.lora_target_modules,
         )
         mark_only_lora_as_trainable(model)
-        # [COPILOT] Keep all task-aware modules fully trainable even when LoRA mode freezes base model weights.
+        # [COPILOT] Keep only task-aware input adapters trainable pre-stage (queries + text/vggt projections).
         for name, param in model.named_parameters():
-            if name.startswith("taskaware_"):
+            if hasattr(model, "is_taskaware_input_adapter_param") and model.is_taskaware_input_adapter_param(name):
                 param.requires_grad = True
 
         # [COPILOT] Ensure vision tower does NOT participate in LoRA updates
@@ -671,6 +693,19 @@ def train_loop(config: _config.TrainConfig):
             raise FileNotFoundError(f"VGGT weight file not found at {vggt_path}")
         vggt_model.load_state_dict(torch.load(vggt_path), strict=False)
         logging.info(f"Loaded VGGT weights from {config.vggt_weight_path}")
+
+    # [COPILOT] Load BLIP-2 pretrained task-aware weights; query/text/vggt input adapters remain random by design.
+    blip2_pretrained_path = os.environ.get("BLIP2_PRETRAINED_PATH", "/home/ed1116/qformer_pretrained.pth")
+    model_base_for_blip2 = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    if hasattr(model_base_for_blip2, "load_taskaware_pretrained_from_blip2"):
+        if not os.path.exists(blip2_pretrained_path):
+            raise FileNotFoundError(
+                f"BLIP-2 pretrained checkpoint not found at {blip2_pretrained_path}. "
+                "Set BLIP2_PRETRAINED_PATH to your checkpoint path."
+            )
+        model_base_for_blip2.load_taskaware_pretrained_from_blip2(blip2_pretrained_path)
+    else:
+        raise AttributeError("PI0Pytorch model must implement load_taskaware_pretrained_from_blip2().")
 
     # Optimizer + learning rate schedule from config
     base_warmup_steps = int(config.lr_schedule.warmup_steps)
@@ -885,9 +920,18 @@ def train_loop(config: _config.TrainConfig):
         vlm_train = stats["VLM"]["trainable"]
         align_train = stats["Align"]["trainable"]
         vggt_train = stats["VGGT"]["trainable"]
+        # [COPILOT] Q-Former core must remain frozen for all stages; only input adapters can train in stage 1/3.
+        model_base = _unwrap_module(model)
+        qformer_core_train = sum(
+            p.numel() for n, p in model_base.named_parameters() if n.startswith("taskaware_qformer.") and p.requires_grad
+        )
 
         if vggt_train != 0:
             raise RuntimeError(f"VGGT must stay frozen, but found {vggt_train} trainable params.")
+        if qformer_core_train != 0:
+            raise RuntimeError(
+                f"Q-Former core must stay frozen across all stages, but found {qformer_core_train} trainable params."
+            )
         if stage == 1:
             if vlm_train != 0 or align_train != 0:
                 raise RuntimeError(
@@ -1121,8 +1165,14 @@ def train_loop(config: _config.TrainConfig):
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(_to_device_with_dtype, observation)  # noqa: PLW2901, [COPILOT]
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            # [COPILOT] Stage 1 fast path: action/align losses are disabled, so avoid large action-tensor GPU transfers.
+            if action_loss_coeff > 0 or align_loss_coeff > 0:
+                actions = actions.to(torch.float32)  # noqa: PLW2901
+                actions = actions.to(device)  # noqa: PLW2901
+                model_actions = actions
+            else:
+                # [COPILOT] Keep only a tiny placeholder on-device for zero-loss tensor allocation.
+                model_actions = torch.zeros((actions.shape[0], 1, 1), dtype=torch.float32, device=device)
 
             # [COPILOT] Gradient accumulation context
             is_accum_step = (accum_step + 1) % grad_accum_steps != 0
@@ -1130,14 +1180,16 @@ def train_loop(config: _config.TrainConfig):
             if use_ddp and is_accum_step:
                 no_sync_ctx = contextlib.ExitStack()
                 no_sync_ctx.enter_context(model.no_sync())
-                no_sync_ctx.enter_context(align_projector.no_sync())
+                # [COPILOT] Stage 1 does not use align branch; skip align-projector DDP no_sync to reduce overhead.
+                if align_loss_coeff > 0:
+                    no_sync_ctx.enter_context(align_projector.no_sync())
 
             with no_sync_ctx:
                 # Forward pass (AMP) [COPILOT]
                 with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                     # [COPILOT] Skip ITC/ITM computation when task_loss_coeff is zero (stage 2) to save memory.
                     action_losses, align_loss, task_loss = model(
-                        observation, actions, vggt=vggt_model, align_proj=align_projector,
+                        observation, model_actions, vggt=vggt_model, align_proj=align_projector,
                         compute_task_loss=(task_loss_coeff > 0),
                         # [COPILOT] Stage-aware compute gating:
                         # - stage 1: skip action/align forward entirely (coeff=0), train only task-aware branch.

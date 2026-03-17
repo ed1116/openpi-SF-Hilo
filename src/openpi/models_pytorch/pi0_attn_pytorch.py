@@ -285,13 +285,18 @@ class PI0Pytorch(nn.Module):
         self.taskaware_qformer_cross_attention_freq = max(
             1, int(getattr(extra_config, "taskaware_qformer_cross_attention_freq", 2))
         )
-        # [COPILOT] Keep Q-Former query/text space at 768 and only project VLM text into that space.
+        # [COPILOT] Keep Q-Former query/text space at 768 and project VGGT key/value into BLIP-2 encoder width (1408).
         self.taskaware_qformer_dim = int(getattr(extra_config, "taskaware_qformer_dim", 768))
-        self.taskaware_qformer_heads = int(getattr(extra_config, "taskaware_qformer_heads", 8))
-        self.taskaware_qformer_dropout = float(getattr(extra_config, "taskaware_qformer_dropout", 0.0))
+        self.taskaware_vggt_proj_dim = int(getattr(extra_config, "taskaware_vggt_proj_dim", 1408))
+        # [COPILOT] Default to BLIP-2/BERT-base head count when config does not explicitly override it.
+        self.taskaware_qformer_heads = int(getattr(extra_config, "taskaware_qformer_heads", 12))
+        # [COPILOT] Default to BLIP-2-style dropout when config does not explicitly override it.
+        self.taskaware_qformer_dropout = float(getattr(extra_config, "taskaware_qformer_dropout", 0.1))
+        # [COPILOT] BLIP-2 ITC head output width (vision/text projection dim).
+        self.taskaware_itc_dim = int(getattr(extra_config, "taskaware_itc_dim", 256))
         self.taskaware_qformer = TaskAwareQFormer(
             hidden_dim=self.taskaware_qformer_dim,
-            encoder_dim=self.LLM_width,
+            encoder_dim=self.taskaware_vggt_proj_dim,
             num_heads=self.taskaware_qformer_heads,
             num_layers=int(getattr(extra_config, "taskaware_qformer_layers", 4)),
             mlp_ratio=float(getattr(extra_config, "taskaware_qformer_mlp_ratio", 4.0)),
@@ -300,6 +305,8 @@ class PI0Pytorch(nn.Module):
         )
         # [COPILOT] Single-layer MLP projection: VLM text hidden (2048) -> Q-Former text input (768).
         self.taskaware_text_in_proj = nn.Linear(self.LLM_width, self.taskaware_qformer_dim)
+        # [COPILOT] Single-layer MLP projection: VGGT hidden (2048) -> BLIP-2 cross-attn key/value width (1408).
+        self.taskaware_vggt_in_proj = nn.Linear(self.LLM_width, self.taskaware_vggt_proj_dim)
         self.taskaware_query_tokens = nn.Parameter(
             torch.zeros(self.taskaware_num_views, self.taskaware_queries_per_view, self.taskaware_qformer_dim)
         )
@@ -307,9 +314,9 @@ class PI0Pytorch(nn.Module):
         self.taskaware_query_pos = nn.Parameter(torch.zeros(1, self.taskaware_queries_per_view, self.taskaware_qformer_dim))
         nn.init.normal_(self.taskaware_query_tokens, std=0.02)
         nn.init.normal_(self.taskaware_query_pos, std=0.02)
-        # [COPILOT] BLIP-2 style auxiliary heads for task-aware ITC/ITM/LM objectives.
-        self.taskaware_vision_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_qformer_dim)
-        self.taskaware_text_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_qformer_dim)
+        # [COPILOT] BLIP-2 style auxiliary heads: project Q-Former hidden (768) into ITC embedding space (default 256).
+        self.taskaware_vision_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_itc_dim)
+        self.taskaware_text_proj = nn.Linear(self.taskaware_qformer_dim, self.taskaware_itc_dim)
         self.taskaware_itm_cross_attn = nn.MultiheadAttention(
             self.taskaware_qformer_dim,
             self.taskaware_qformer_heads,
@@ -328,6 +335,12 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+        # [COPILOT] Enforce Q-Former-core freeze at initialization; only query/input adapters are trained from scratch.
+        self._freeze_taskaware_qformer_core()
+        # [COPILOT] Cache whether stage runtime currently trains task-aware input adapters (queries + text/vggt projections).
+        self.taskaware_adapter_trainable = False
+        self._update_taskaware_adapter_trainable_flag()
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -356,6 +369,151 @@ class PI0Pytorch(nn.Module):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
 
+    # [COPILOT] True for the only task-aware params trained from scratch: queries + text/vggt input projections.
+    def is_taskaware_input_adapter_param(self, name: str) -> bool:
+        return (
+            name in {"taskaware_query_tokens", "taskaware_query_pos"}
+            or name.startswith("taskaware_text_in_proj.")
+            or name.startswith("taskaware_vggt_in_proj.")
+        )
+
+    # [COPILOT] Keep Q-Former core frozen across all stages.
+    def _freeze_taskaware_qformer_core(self) -> None:
+        for name, param in self.named_parameters():
+            if name.startswith("taskaware_qformer."):
+                param.requires_grad = False
+
+    # [COPILOT] Update cached adapter-trainable flag to avoid scanning all task-aware params in every forward.
+    def _update_taskaware_adapter_trainable_flag(self) -> None:
+        self.taskaware_adapter_trainable = any(
+            param.requires_grad
+            for name, param in self.named_parameters()
+            if self.is_taskaware_input_adapter_param(name)
+        )
+
+    # [COPILOT] Load BLIP-2 checkpoint and map pretrained Q-Former (plus task heads) into current task-aware modules.
+    def load_taskaware_pretrained_from_blip2(self, checkpoint_path: str) -> None:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("model"), dict):
+            source_state = ckpt["model"]
+        elif isinstance(ckpt, dict) and isinstance(ckpt.get("state_dict"), dict):
+            source_state = ckpt["state_dict"]
+        elif isinstance(ckpt, dict):
+            source_state = ckpt
+        else:
+            raise TypeError(f"Unsupported BLIP-2 checkpoint format: {type(ckpt)}")
+
+        target_state = self.state_dict()
+        mapped_state: dict[str, torch.Tensor] = {}
+
+        # [COPILOT] Helper: copy a tensor only when source key exists and tensor shape matches.
+        def _copy_if_compatible(dst_key: str, src_key: str) -> None:
+            if src_key not in source_state:
+                return
+            if dst_key not in target_state:
+                return
+            src_tensor = source_state[src_key]
+            if src_tensor.shape != target_state[dst_key].shape:
+                return
+            mapped_state[dst_key] = src_tensor
+
+        # [COPILOT] Helper: concatenate Q/K/V tensors from BLIP-2 into MultiheadAttention in-proj format.
+        def _copy_qkv(dst_w: str, dst_b: str, src_prefix: str) -> None:
+            q_w = source_state.get(f"{src_prefix}.query.weight")
+            k_w = source_state.get(f"{src_prefix}.key.weight")
+            v_w = source_state.get(f"{src_prefix}.value.weight")
+            q_b = source_state.get(f"{src_prefix}.query.bias")
+            k_b = source_state.get(f"{src_prefix}.key.bias")
+            v_b = source_state.get(f"{src_prefix}.value.bias")
+            if q_w is None or k_w is None or v_w is None or q_b is None or k_b is None or v_b is None:
+                return
+            # [COPILOT] Only concatenate Q/K/V weights when input dims match (self-attn case).
+            # Cross-attn uses different K/V input width, so weight concatenation is invalid.
+            if q_w.shape[1:] == k_w.shape[1:] == v_w.shape[1:]:
+                cat_w = torch.cat([q_w, k_w, v_w], dim=0)
+                if dst_w in target_state and cat_w.shape == target_state[dst_w].shape:
+                    mapped_state[dst_w] = cat_w
+            # [COPILOT] Q/K/V bias widths match in BLIP-2, so concatenated bias mapping is valid.
+            cat_b = torch.cat([q_b, k_b, v_b], dim=0)
+            if dst_b in target_state and cat_b.shape == target_state[dst_b].shape:
+                mapped_state[dst_b] = cat_b
+
+        # [COPILOT] Map BLIP-2 Q-Former encoder layers to TaskAwareQFormer layers 1:1 (first N layers).
+        for layer_idx, layer in enumerate(self.taskaware_qformer.layers):
+            src = f"Qformer.bert.encoder.layer.{layer_idx}"
+            dst = f"taskaware_qformer.layers.{layer_idx}"
+
+            _copy_qkv(
+                f"{dst}.self_attn.in_proj_weight",
+                f"{dst}.self_attn.in_proj_bias",
+                f"{src}.attention.self",
+            )
+            _copy_if_compatible(f"{dst}.self_attn.out_proj.weight", f"{src}.attention.output.dense.weight")
+            _copy_if_compatible(f"{dst}.self_attn.out_proj.bias", f"{src}.attention.output.dense.bias")
+            _copy_if_compatible(f"{dst}.norm_qt.weight", f"{src}.attention.output.LayerNorm.weight")
+            _copy_if_compatible(f"{dst}.norm_qt.bias", f"{src}.attention.output.LayerNorm.bias")
+
+            # [COPILOT] BLIP-2 applies cross-attn on selected layers (freq=2 by default); map only when present.
+            if layer.has_cross_attention:
+                _copy_if_compatible(f"{dst}.cross_attn.q_proj_weight", f"{src}.crossattention.self.query.weight")
+                _copy_if_compatible(f"{dst}.cross_attn.k_proj_weight", f"{src}.crossattention.self.key.weight")
+                _copy_if_compatible(f"{dst}.cross_attn.v_proj_weight", f"{src}.crossattention.self.value.weight")
+                # [COPILOT] For cross-attn (kdim/vdim), map only concatenated Q/K/V bias into in_proj_bias.
+                q_b = source_state.get(f"{src}.crossattention.self.query.bias")
+                k_b = source_state.get(f"{src}.crossattention.self.key.bias")
+                v_b = source_state.get(f"{src}.crossattention.self.value.bias")
+                if q_b is not None and k_b is not None and v_b is not None:
+                    cat_b = torch.cat([q_b, k_b, v_b], dim=0)
+                    dst_cross_b = f"{dst}.cross_attn.in_proj_bias"
+                    if dst_cross_b in target_state and cat_b.shape == target_state[dst_cross_b].shape:
+                        mapped_state[dst_cross_b] = cat_b
+                _copy_if_compatible(f"{dst}.cross_attn.out_proj.weight", f"{src}.crossattention.output.dense.weight")
+                _copy_if_compatible(f"{dst}.cross_attn.out_proj.bias", f"{src}.crossattention.output.dense.bias")
+                _copy_if_compatible(f"{dst}.norm_cross.weight", f"{src}.crossattention.output.LayerNorm.weight")
+                _copy_if_compatible(f"{dst}.norm_cross.bias", f"{src}.crossattention.output.LayerNorm.bias")
+
+            _copy_if_compatible(f"{dst}.ffn_query.0.weight", f"{src}.intermediate_query.dense.weight")
+            _copy_if_compatible(f"{dst}.ffn_query.0.bias", f"{src}.intermediate_query.dense.bias")
+            _copy_if_compatible(f"{dst}.ffn_query.2.weight", f"{src}.output_query.dense.weight")
+            _copy_if_compatible(f"{dst}.ffn_query.2.bias", f"{src}.output_query.dense.bias")
+            _copy_if_compatible(f"{dst}.norm_ffn_query.weight", f"{src}.output_query.LayerNorm.weight")
+            _copy_if_compatible(f"{dst}.norm_ffn_query.bias", f"{src}.output_query.LayerNorm.bias")
+
+            _copy_if_compatible(f"{dst}.ffn_text.0.weight", f"{src}.intermediate.dense.weight")
+            _copy_if_compatible(f"{dst}.ffn_text.0.bias", f"{src}.intermediate.dense.bias")
+            _copy_if_compatible(f"{dst}.ffn_text.2.weight", f"{src}.output.dense.weight")
+            _copy_if_compatible(f"{dst}.ffn_text.2.bias", f"{src}.output.dense.bias")
+            _copy_if_compatible(f"{dst}.norm_ffn_text.weight", f"{src}.output.LayerNorm.weight")
+            _copy_if_compatible(f"{dst}.norm_ffn_text.bias", f"{src}.output.LayerNorm.bias")
+
+        _copy_if_compatible("taskaware_qformer.norm.weight", "Qformer.bert.embeddings.LayerNorm.weight")
+        _copy_if_compatible("taskaware_qformer.norm.bias", "Qformer.bert.embeddings.LayerNorm.bias")
+        _copy_if_compatible("taskaware_vision_proj.weight", "vision_proj.weight")
+        _copy_if_compatible("taskaware_vision_proj.bias", "vision_proj.bias")
+        _copy_if_compatible("taskaware_text_proj.weight", "text_proj.weight")
+        _copy_if_compatible("taskaware_text_proj.bias", "text_proj.bias")
+        _copy_if_compatible("taskaware_itm_head.weight", "itm_head.weight")
+        _copy_if_compatible("taskaware_itm_head.bias", "itm_head.bias")
+        _copy_if_compatible("taskaware_temp", "temp")
+
+        # [COPILOT] Keep random initialization for query_tokens/text_in_proj/vggt_in_proj as requested.
+        mapped_state.pop("taskaware_query_tokens", None)
+        mapped_state.pop("taskaware_text_in_proj.weight", None)
+        mapped_state.pop("taskaware_text_in_proj.bias", None)
+        mapped_state.pop("taskaware_vggt_in_proj.weight", None)
+        mapped_state.pop("taskaware_vggt_in_proj.bias", None)
+
+        load_info = self.load_state_dict(mapped_state, strict=False)
+        logging.info(
+            "[COPILOT] Loaded BLIP-2 task-aware weights from %s (mapped=%d, missing=%d, unexpected=%d)",
+            checkpoint_path,
+            len(mapped_state),
+            len(load_info.missing_keys),
+            len(load_info.unexpected_keys),
+        )
+        self._freeze_taskaware_qformer_core()
+        self._update_taskaware_adapter_trainable_flag()
+
     def set_trainable_for_stage(self, stage: int, *, lora_enabled: bool) -> None:
         """Configure trainable parameter groups for 3-stage training."""
         if stage not in (1, 2, 3):
@@ -365,10 +523,10 @@ class PI0Pytorch(nn.Module):
         for _, param in self.named_parameters():
             param.requires_grad = False
 
-        # Stage 1 + 3: task-aware blocks full fine-tuning.
+        # [COPILOT] Stage 1 + 3: train only task-aware input adapters from scratch (queries + text/vggt projections).
         if stage in (1, 3):
             for name, param in self.named_parameters():
-                if name.startswith("taskaware_"):
+                if self.is_taskaware_input_adapter_param(name):
                     param.requires_grad = True
 
         # Stage 2 + 3: LoRA updates on VLM backbone/action expert, excluding vision tower.
@@ -381,6 +539,10 @@ class PI0Pytorch(nn.Module):
             for name, param in self.named_parameters():
                 if ("lora_A" in name or "lora_B" in name) and not name.startswith(vision_tower_prefix):
                     param.requires_grad = True
+
+        # [COPILOT] Safety guard: keep Q-Former core frozen regardless of stage.
+        self._freeze_taskaware_qformer_core()
+        self._update_taskaware_adapter_trainable_flag()
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
@@ -608,6 +770,8 @@ class PI0Pytorch(nn.Module):
         base_queries = self.taskaware_query_tokens.unsqueeze(0).expand(bsz, -1, -1, -1)
         # [COPILOT] Keep strict patch-order correspondence: query token + patch position embedding only.
         queries = base_queries + self.taskaware_query_pos[:, None, :, :]
+        # [COPILOT] Project VGGT tokens from 2048 -> 1408 before Q-Former cross-attention (BLIP-2 compatible K/V width).
+        vggt_hidden = self.taskaware_vggt_in_proj(vggt_hidden.to(dtype=queries.dtype))
 
         query_outputs = []
         for view_idx in range(num_views):
@@ -782,10 +946,8 @@ class PI0Pytorch(nn.Module):
         )
         img_resize_wo_aug = preprocess_images_from_openpi(img_wo_aug)  # specific for VGGT with 518px input
 
-        # [COPILOT] Check once whether any taskaware_ param is trainable (True in stage 1/3, False in stage 2).
-        taskaware_needs_grad = any(
-            p.requires_grad for n, p in self.named_parameters() if n.startswith("taskaware_")
-        )
+        # [COPILOT] Stage-aware adapter trainability cache (True in stage 1/3, False in stage 2).
+        taskaware_needs_grad = bool(getattr(self, "taskaware_adapter_trainable", False))
 
         prefix_embs, prefix_pad_masks, prefix_att_masks, img_len = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks

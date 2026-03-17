@@ -516,11 +516,12 @@ class TrainConfig:
     taskaware_text_dropout: float = 0.1
     taskaware_query_side: int = 16
     taskaware_qformer_dim: int = 768  # [COPILOT] Shared hidden size for task-aware queries/text inside Q-Former.
-    taskaware_qformer_layers: int = 4
-    taskaware_qformer_heads: int = 8
+    taskaware_qformer_layers: int | None = None
+    taskaware_qformer_heads: int | None = None
     taskaware_qformer_mlp_ratio: float = 4.0
     taskaware_qformer_dropout: float = 0.0
     taskaware_qformer_cross_attention_freq: int = 2  # [COPILOT] BLIP-2 style cross-attention cadence (every N layers).
+    taskaware_itc_dim: int = 256  # [COPILOT] BLIP-2 ITC projection output dimension for vision/text features.
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "float32"
@@ -972,9 +973,9 @@ _CONFIGS = [
         taskaware_stage3_task_loss_coeff=0.05, # [COPILOT] Stage 3 task loss coefficient.
         
         taskaware_stage1_batch_size=32, # [COPILOT] Stage 1 global batch size.
-        taskaware_stage23_batch_size=32, # [COPILOT] Stage 2/3 global batch size.
+        taskaware_stage23_batch_size=16, # [COPILOT] Stage 2/3 global batch size.
         taskaware_stage1_grad_accum_steps=2, # [COPILOT] Stage 1 gradient accumulation.
-        taskaware_stage23_grad_accum_steps=1, # [COPILOT] Stage 2/3 gradient accumulation.
+        taskaware_stage23_grad_accum_steps=2, # [COPILOT] Stage 2/3 gradient accumulation.
         
         taskaware_stage1_lr_warmup_steps=500, # [COPILOT] Stage 1 LR schedule.
         taskaware_stage1_lr_peak=1e-5,
@@ -998,7 +999,76 @@ _CONFIGS = [
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         num_train_steps=35000,
-        save_interval=5000,
+        save_interval=1000,
+        gradient_checkpointing=True,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+
+    # [COPILOT] pi05 attention config with BLIP2-pretrained Q-Former core (core frozen; adapters trainable).
+    #############################################################################
+    TrainConfig(
+        name="pi05_attn_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_full_torch",
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,  # [COPILOT] Align target uses (k+1)-th VLM image tokens.
+        vggt_layers_align=-1,
+
+        taskaware_text_layer=11,  # [COPILOT] Q-Former text conditioning uses k-th VLM text tokens.
+        taskaware_text_detach=True,
+        taskaware_text_dropout=0.1,
+        taskaware_qformer_dim=768,  # [COPILOT] Match BLIP-2 Q-Former hidden size.
+        taskaware_qformer_heads=12,  # [COPILOT] Match BLIP-2/BERT-base attention head count.
+        taskaware_qformer_mlp_ratio=4.0,
+        taskaware_qformer_layers=12,  # [COPILOT] PoC speed setting: use a smaller 2-block TaskAware Q-Former.
+        taskaware_qformer_dropout=0.1,  # [COPILOT] Match BLIP-2 Q-Former dropout.
+        taskaware_qformer_cross_attention_freq=2,
+        taskaware_itc_dim=256,  # [COPILOT] Match BLIP-2 ITC projection width.
+        align_projector_hidden_dim=1024,  # [COPILOT] Task-aware VLM projection: 2048 -> 1024 -> 768.
+        align_projector_out_dim=768,  # [COPILOT] Match projector output to Q-Former output for cosine alignment.
+
+        pytorch_training_precision="float32",  # [COPILOT] Keep baseline precision consistent with task-aware config.
+        use_vlm_norm=True,
+        align_loss_coeff=0.5,
+        taskaware_stage1_steps=10_000,  # [COPILOT] Recommended shorter stage 1 due to BLIP2-pretrained frozen core.
+        taskaware_stage2_steps=20_000,  # [COPILOT] Keep action+align stage budget from prior setup.
+        taskaware_stage3_steps=5_000,  # [COPILOT] Keep joint tuning budget while training only adapters on task branch.
+        taskaware_stage1_task_loss_coeff=1.0,
+        taskaware_stage3_task_loss_coeff=0.05,
+
+        taskaware_stage1_batch_size=32,  # [COPILOT] Recommended larger stage 1 batch (no action/align compute).
+        taskaware_stage23_batch_size=32,
+        taskaware_stage1_grad_accum_steps=2,  # [COPILOT] Requested: stage 1 accumulation set to 1.
+        taskaware_stage23_grad_accum_steps=1,
+
+        taskaware_stage1_lr_warmup_steps=500,  # [COPILOT] Stage 1 LR schedule scaled to 5k steps.
+        taskaware_stage1_lr_peak=1e-5,
+        taskaware_stage1_lr_decay_steps=10_000,
+        taskaware_stage1_lr_decay_lr=1e-6,
+        taskaware_stage23_lr_warmup_steps=1_250,
+        taskaware_stage23_lr_peak=2.5e-5,
+        taskaware_stage23_lr_decay_steps=25_000,
+        taskaware_stage23_lr_decay_lr=2.5e-6,
+
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=35_000,
+        save_interval=1000,
         gradient_checkpointing=True,
         ema_decay=None,
         wandb_enabled=True,
