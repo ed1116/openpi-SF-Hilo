@@ -523,6 +523,42 @@ class TrainConfig:
     taskaware_qformer_cross_attention_freq: int = 2  # [COPILOT] BLIP-2 style cross-attention cadence (every N layers).
     taskaware_itc_dim: int = 256  # [COPILOT] BLIP-2 ITC projection output dimension for vision/text features.
 
+    # [COPILOT] New BLIP-2-style full Q-Former pipeline options (for train_new_pytorch / pi0_new_pytorch).
+    # Keep these names in a dedicated `new_*` namespace.
+    new_subtext_layer: int | None = None
+    new_subimage_layer: int | None = None
+    new_query_side: int = 16
+    new_qformer_dim: int = 768
+    new_qformer_encoder_width: int = 1408
+    new_qformer_layers: int = 12
+    new_qformer_heads: int = 12
+    new_qformer_dropout: float = 0.1
+    new_qformer_cross_attention_freq: int = 2
+    new_itc_dim: int = 256
+    new_qformer_ref_path: str | None = None
+    new_qformer_pretrained_path: str | None = None
+    new_align_projector_hidden_dim: int | None = None
+    new_align_projector_out_dim: int | None = None
+    # [COPILOT] Optional 3-stage schedule controls for train_new_pytorch.
+    new_stage1_steps: int | None = None
+    new_stage2_steps: int | None = None
+    new_stage3_steps: int | None = None
+    new_stage1_task_loss_coeff: float = 1.0
+    new_stage3_task_loss_coeff: float | None = None
+    # [COPILOT] Stage-specific runtime knobs (batch/grad-accum/lr schedule).
+    new_stage1_batch_size: int | None = None
+    new_stage23_batch_size: int | None = None
+    new_stage1_grad_accum_steps: int | None = None
+    new_stage23_grad_accum_steps: int | None = None
+    new_stage1_lr_warmup_steps: int | None = None
+    new_stage1_lr_peak: float | None = None
+    new_stage1_lr_decay_steps: int | None = None
+    new_stage1_lr_decay_lr: float | None = None
+    new_stage23_lr_warmup_steps: int | None = None
+    new_stage23_lr_peak: float | None = None
+    new_stage23_lr_decay_steps: int | None = None
+    new_stage23_lr_decay_lr: float | None = None
+
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float16", "float32"] = "float32"
 
@@ -1006,10 +1042,10 @@ _CONFIGS = [
     ),
     #############################################################################
 
-    # [COPILOT] pi05 attention config with BLIP2-pretrained Q-Former core (core frozen; adapters trainable).
+    # [COPILOT] pi05 new BLIP-2-style full Q-Former config (VGGT compression + SUBTEXT conditioning).
     #############################################################################
     TrainConfig(
-        name="pi05_attn_libero_lora",
+        name="pi05_new_libero_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
@@ -1023,44 +1059,51 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_full_torch",
         vggt_weight_path="./checkpoints/vggt",
-        vla_layers_align=12,  # [COPILOT] Align target uses (k+1)-th VLM image tokens.
+        vla_layers_align=12,
         vggt_layers_align=-1,
 
-        taskaware_text_layer=11,  # [COPILOT] Q-Former text conditioning uses k-th VLM text tokens.
-        taskaware_text_detach=True,
-        taskaware_text_dropout=0.1,
-        taskaware_qformer_dim=768,  # [COPILOT] Match BLIP-2 Q-Former hidden size.
-        taskaware_qformer_heads=12,  # [COPILOT] Match BLIP-2/BERT-base attention head count.
-        taskaware_qformer_mlp_ratio=4.0,
-        taskaware_qformer_layers=12,  # [COPILOT] PoC speed setting: use a smaller 2-block TaskAware Q-Former.
-        taskaware_qformer_dropout=0.1,  # [COPILOT] Match BLIP-2 Q-Former dropout.
-        taskaware_qformer_cross_attention_freq=2,
-        taskaware_itc_dim=256,  # [COPILOT] Match BLIP-2 ITC projection width.
-        align_projector_hidden_dim=1024,  # [COPILOT] Task-aware VLM projection: 2048 -> 1024 -> 768.
-        align_projector_out_dim=768,  # [COPILOT] Match projector output to Q-Former output for cosine alignment.
+        # [COPILOT] New Q-Former pipeline: SUBTEXT from layer 11, SUBIMAGE from layer 12.
+        new_subtext_layer=11,
+        new_subimage_layer=12,
+        new_query_side=16,  # 2 views * (16x16) = 512 learnable queries total.
+        new_qformer_dim=768,
+        new_qformer_encoder_width=1408,
+        new_qformer_layers=12,
+        new_qformer_heads=12,
+        new_qformer_dropout=0.1,
+        new_qformer_cross_attention_freq=2,
+        new_itc_dim=256,
+        new_qformer_ref_path="/home/ed1116/Qformer.py",
+        new_qformer_pretrained_path="/home/ed1116/qformer_pretrained.pth",
 
-        pytorch_training_precision="float32",  # [COPILOT] Keep baseline precision consistent with task-aware config.
+        # [COPILOT] Align projector: 2048 -> 1024 -> 768.
+        new_align_projector_hidden_dim=1024,
+        new_align_projector_out_dim=768,
+
+        pytorch_training_precision="float32",  # [DEBUG]
         use_vlm_norm=True,
-        align_loss_coeff=0.5,
-        taskaware_stage1_steps=10_000,  # [COPILOT] Recommended shorter stage 1 due to BLIP2-pretrained frozen core.
-        taskaware_stage2_steps=20_000,  # [COPILOT] Keep action+align stage budget from prior setup.
-        taskaware_stage3_steps=5_000,  # [COPILOT] Keep joint tuning budget while training only adapters on task branch.
-        taskaware_stage1_task_loss_coeff=1.0,
-        taskaware_stage3_task_loss_coeff=0.05,
+        align_loss_coeff=0.5,  # [COPILOT] train_new uses fixed 0.5 align coefficient in stage2/3.
 
-        taskaware_stage1_batch_size=32,  # [COPILOT] Recommended larger stage 1 batch (no action/align compute).
-        taskaware_stage23_batch_size=32,
-        taskaware_stage1_grad_accum_steps=2,  # [COPILOT] Requested: stage 1 accumulation set to 1.
-        taskaware_stage23_grad_accum_steps=1,
+        # [COPILOT] 3-stage schedule.
+        new_stage1_steps=10_000,
+        new_stage2_steps=20_000,
+        new_stage3_steps=5_000,
+        new_stage1_task_loss_coeff=1.0,  # Stage 1: ITC + ITM only.
+        new_stage3_task_loss_coeff=0.05,  # Stage 3: Action + 0.5*Align + coeff*(ITC+ITM).
 
-        taskaware_stage1_lr_warmup_steps=500,  # [COPILOT] Stage 1 LR schedule scaled to 5k steps.
-        taskaware_stage1_lr_peak=1e-5,
-        taskaware_stage1_lr_decay_steps=10_000,
-        taskaware_stage1_lr_decay_lr=1e-6,
-        taskaware_stage23_lr_warmup_steps=1_250,
-        taskaware_stage23_lr_peak=2.5e-5,
-        taskaware_stage23_lr_decay_steps=25_000,
-        taskaware_stage23_lr_decay_lr=2.5e-6,
+        # [COPILOT] Stage runtime knobs.
+        new_stage1_batch_size=32,
+        new_stage23_batch_size=16,
+        new_stage1_grad_accum_steps=2,
+        new_stage23_grad_accum_steps=2,
+        new_stage1_lr_warmup_steps=500,
+        new_stage1_lr_peak=1e-5,
+        new_stage1_lr_decay_steps=10_000,
+        new_stage1_lr_decay_lr=1e-6,
+        new_stage23_lr_warmup_steps=1_250,
+        new_stage23_lr_peak=2.5e-5,
+        new_stage23_lr_decay_steps=25_000,
+        new_stage23_lr_decay_lr=2.5e-6,
 
         lora_enabled=True,
         lora_rank=8,
@@ -1161,159 +1204,6 @@ _CONFIGS = [
 
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
     # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    TrainConfig(
-        name="pi0_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-    ),
-    TrainConfig(
-        name="pi05_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
-        batch_size=64,
-    ),
-    #
-    # Fine-tuning DROID configs.
-    #
-    TrainConfig(
-        # This config is for fine-tuning pi0-FAST-base on the *full* DROID dataset.
-        # We use RLDS data loading to make training on this large dataset tractable.
-        # For fine-tuning on your own DROID dataset, see below.
-        name="pi0_fast_full_droid_finetune",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=8,
-            action_horizon=16,
-            max_token_len=180,
-        ),
-        data=RLDSDroidDataConfig(
-            repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="<path_to_droid_rlds_dataset>",
-            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        num_train_steps=100_000,  # 100k steps should be sufficient, takes ~2 days on 8x H100s
-        batch_size=256,
-        log_interval=100,
-        save_interval=5000,
-        keep_period=20_000,
-        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
-    ),
-    TrainConfig(
-        # This config is for fine-tuning pi05 on the *full* DROID dataset.
-        # We use RLDS data loading to make training on this large dataset tractable.
-        # For fine-tuning on your own DROID dataset, see below.
-        name="pi05_full_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-        ),
-        data=RLDSDroidDataConfig(
-            repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
-            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
-                asset_id="droid",
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        num_train_steps=100_000,
-        batch_size=256,
-        log_interval=100,
-        save_interval=5000,
-        keep_period=10_000,
-        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
-    ),
-    TrainConfig(
-        # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
-        # Here, we use LeRobot data format (like for all other fine-tuning examples)
-        # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
-        name="pi05_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
-        ),
-        data=LeRobotDROIDDataConfig(
-            # Replace with your custom DROID LeRobot dataset repo id.
-            repo_id="your_hf_username/my_droid_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
-        num_train_steps=20_000,
-        batch_size=32,
-    ),
-    #
-    # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
-    #
     TrainConfig(
         name="pi0_aloha_sim",
         model=pi0_config.Pi0Config(),

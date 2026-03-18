@@ -45,7 +45,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
-from openpi.models_pytorch import pi0_attn_pytorch, pi0_pytorch, projectors  # [COPILOT] Use attention/Q-Former model.
+from openpi.models_pytorch import pi0_pytorch, pi0_new_pytorch, projectors  # [COPILOT] Use new BLIP-2-style model.
 from openpi.models_pytorch.lora_copilot import apply_lora, get_trainable_parameters, mark_only_lora_as_trainable # [COPILOT]
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -465,9 +465,9 @@ def train_loop(config: _config.TrainConfig):
 
     # [COPILOT] Runtime batch/accum can be stage-specific; world size stays fixed.
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    bootstrap_batch_cfg = getattr(config, "taskaware_stage1_batch_size", None)
+    bootstrap_batch_cfg = getattr(config, "new_stage1_batch_size", None)
     if bootstrap_batch_cfg is None:
-        bootstrap_batch_size = int(os.environ.get("TASKAWARE_STAGE1_BATCH_SIZE", str(config.batch_size)))
+        bootstrap_batch_size = int(os.environ.get("NEW_STAGE1_BATCH_SIZE", str(config.batch_size)))
     else:
         bootstrap_batch_size = int(bootstrap_batch_cfg)
     if bootstrap_batch_size % world_size != 0:
@@ -535,29 +535,13 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    # [COPILOT] Train-attn-only override: force pi05 language token budget to 48 for memory/runtime control.
-    if getattr(model_cfg, "pi05", False):
-        object.__setattr__(model_cfg, "max_token_len", 48)
-        # [COPILOT] Enforce BLIP-2-aligned task-aware hyperparameters for stable pretrained weight reuse.
-        _blip2_aligned_overrides = {
-            "taskaware_qformer_dim": 768,
-            "taskaware_qformer_heads": 12,
-            "taskaware_qformer_dropout": 0.1,
-            "taskaware_qformer_cross_attention_freq": 2,
-            "taskaware_itc_dim": 256,
-        }
-        for _key, _value in _blip2_aligned_overrides.items():
-            _current = getattr(config, _key, None)
-            if _current != _value:
-                logging.info(
-                    "[COPILOT] Overriding %s from %s to %s for BLIP-2 pretrained alignment.",
-                    _key,
-                    _current,
-                    _value,
-                )
-                object.__setattr__(config, _key, _value)
+    # [COPILOT] Limit pi05 max token length to 48 in this training path only.
+    if getattr(model_cfg, "pi05", False) and getattr(model_cfg, "max_token_len", None) is not None:
+        if model_cfg.max_token_len > 48:
+            object.__setattr__(model_cfg, "max_token_len", 48)
+            logging.info("Applied pi05 max_token_len override for train_new_pytorch: 48")
 
-    model = openpi.models_pytorch.pi0_attn_pytorch.PI0Pytorch(model_cfg, config).to(device)  # [COPILOT] Attention/Q-Former alignment model.
+    model = openpi.models_pytorch.pi0_new_pytorch.PI0Pytorch(model_cfg, config).to(device)
     vggt_model = VGGT(
         enable_camera=False,
         enable_point=False,
@@ -570,13 +554,13 @@ def train_loop(config: _config.TrainConfig):
     vggt_model.eval()
     vggt_model.requires_grad_(False)
 
-    # [COPILOT] Use explicit task-aware projector dims from TrainConfig (no legacy fallback path).
+    # [COPILOT] Align projector fixed to 2048 -> 1024 -> 768 for new pipeline.
     align_projector = projectors.AlignProjector(
         model.LLM_width,
-        config.vggt_dim,
+        int(getattr(config, "new_qformer_dim", 768)),
         config.use_vlm_norm,
-        hidden_dim=config.align_projector_hidden_dim,
-        out_dim=config.align_projector_out_dim,
+        hidden_dim=int(getattr(config, "new_align_projector_hidden_dim", 1024)),
+        out_dim=int(getattr(config, "new_align_projector_out_dim", 768)),
     ).to(device)
 
     # [COPILOT] Switch gradient checkpointing from TrainConfig/CLI flag.
@@ -625,9 +609,9 @@ def train_loop(config: _config.TrainConfig):
             target_modules=config.lora_target_modules,
         )
         mark_only_lora_as_trainable(model)
-        # [COPILOT] Keep only task-aware input adapters trainable pre-stage (queries + text/vggt projections).
+        # [COPILOT] Keep all new_* modules visible to optimizer; runtime stage gating will toggle trainability.
         for name, param in model.named_parameters():
-            if hasattr(model, "is_taskaware_input_adapter_param") and model.is_taskaware_input_adapter_param(name):
+            if name.startswith("new_"):
                 param.requires_grad = True
 
         # [COPILOT] Ensure vision tower does NOT participate in LoRA updates
@@ -694,26 +678,12 @@ def train_loop(config: _config.TrainConfig):
         vggt_model.load_state_dict(torch.load(vggt_path), strict=False)
         logging.info(f"Loaded VGGT weights from {config.vggt_weight_path}")
 
-    # [COPILOT] Load BLIP-2 pretrained task-aware weights; query/text/vggt input adapters remain random by design.
-    blip2_pretrained_path = os.environ.get("BLIP2_PRETRAINED_PATH", "/home/ed1116/qformer_pretrained.pth")
-    model_base_for_blip2 = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    if hasattr(model_base_for_blip2, "load_taskaware_pretrained_from_blip2"):
-        if not os.path.exists(blip2_pretrained_path):
-            raise FileNotFoundError(
-                f"BLIP-2 pretrained checkpoint not found at {blip2_pretrained_path}. "
-                "Set BLIP2_PRETRAINED_PATH to your checkpoint path."
-            )
-        model_base_for_blip2.load_taskaware_pretrained_from_blip2(blip2_pretrained_path)
-    else:
-        raise AttributeError("PI0Pytorch model must implement load_taskaware_pretrained_from_blip2().")
-
     # Optimizer + learning rate schedule from config
     base_warmup_steps = int(config.lr_schedule.warmup_steps)
     base_peak_lr = float(config.lr_schedule.peak_lr)
     base_decay_steps = int(config.lr_schedule.decay_steps)
     base_end_lr = float(config.lr_schedule.decay_lr)
-    # [COPILOT][EXCLUDE] LM/ITG is disabled in the model; task-aware auxiliary objective is ITC + ITM only.
-    taskaware_loss_coeff = float(getattr(config, "taskaware_loss_coeff", 1.0))
+    # [COPILOT][EXCLUDE] LM/ITG is disabled in the model; auxiliary objective is ITC + ITM only.
     # [COPILOT] Resolve stage settings with priority: config.py > env var > default.
     def _resolve_int_setting(config_value, env_key: str, default: int) -> int:
         if config_value is not None:
@@ -726,11 +696,11 @@ def train_loop(config: _config.TrainConfig):
         return float(os.environ.get(env_key, str(default)))
 
     # [COPILOT] Fixed 3-stage schedule defaults: 5k / 13k / 2k.
-    stage1_steps = _resolve_int_setting(getattr(config, "taskaware_stage1_steps", None), "TASKAWARE_STAGE1_STEPS", 5000)
-    stage2_steps = _resolve_int_setting(getattr(config, "taskaware_stage2_steps", None), "TASKAWARE_STAGE2_STEPS", 13000)
-    stage3_steps = _resolve_int_setting(getattr(config, "taskaware_stage3_steps", None), "TASKAWARE_STAGE3_STEPS", 2000)
+    stage1_steps = _resolve_int_setting(getattr(config, "new_stage1_steps", None), "NEW_STAGE1_STEPS", 5000)
+    stage2_steps = _resolve_int_setting(getattr(config, "new_stage2_steps", None), "NEW_STAGE2_STEPS", 13000)
+    stage3_steps = _resolve_int_setting(getattr(config, "new_stage3_steps", None), "NEW_STAGE3_STEPS", 2000)
     if stage1_steps < 0 or stage2_steps < 0 or stage3_steps < 0:
-        raise ValueError("TASKAWARE_STAGE{1,2,3}_STEPS must be non-negative")
+        raise ValueError("NEW_STAGE{1,2,3}_STEPS must be non-negative")
     if (stage2_steps > 0 or stage3_steps > 0) and not config.lora_enabled:
         raise ValueError("3-stage setup requires lora_enabled=True because stage 2/3 train LoRA adapters.")
     if stage1_steps + stage2_steps + stage3_steps != config.num_train_steps:
@@ -739,74 +709,74 @@ def train_loop(config: _config.TrainConfig):
             f"Got stage sum={stage1_steps + stage2_steps + stage3_steps}, num_train_steps={config.num_train_steps}"
         )
     stage1_task_loss_coeff = _resolve_float_setting(
-        getattr(config, "taskaware_stage1_task_loss_coeff", None),
-        "TASKAWARE_STAGE1_TASK_LOSS_COEFF",
+        getattr(config, "new_stage1_task_loss_coeff", None),
+        "NEW_STAGE1_TASK_LOSS_COEFF",
         1.0,
     )
     stage3_task_loss_coeff = _resolve_float_setting(
-        getattr(config, "taskaware_stage3_task_loss_coeff", None),
-        "TASKAWARE_STAGE3_TASK_LOSS_COEFF",
-        taskaware_loss_coeff,
+        getattr(config, "new_stage3_task_loss_coeff", None),
+        "NEW_STAGE3_TASK_LOSS_COEFF",
+        1.0,
     )
     base_grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "1"))
     stage1_batch_size = _resolve_int_setting(
-        getattr(config, "taskaware_stage1_batch_size", None),
-        "TASKAWARE_STAGE1_BATCH_SIZE",
+        getattr(config, "new_stage1_batch_size", None),
+        "NEW_STAGE1_BATCH_SIZE",
         int(config.batch_size),
     )
     stage23_batch_size = _resolve_int_setting(
-        getattr(config, "taskaware_stage23_batch_size", None),
-        "TASKAWARE_STAGE23_BATCH_SIZE",
+        getattr(config, "new_stage23_batch_size", None),
+        "NEW_STAGE23_BATCH_SIZE",
         int(config.batch_size),
     )
     stage1_grad_accum_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage1_grad_accum_steps", None),
-        "TASKAWARE_STAGE1_GRAD_ACCUM_STEPS",
+        getattr(config, "new_stage1_grad_accum_steps", None),
+        "NEW_STAGE1_GRAD_ACCUM_STEPS",
         base_grad_accum_steps,
     )
     stage23_grad_accum_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage23_grad_accum_steps", None),
-        "TASKAWARE_STAGE23_GRAD_ACCUM_STEPS",
+        getattr(config, "new_stage23_grad_accum_steps", None),
+        "NEW_STAGE23_GRAD_ACCUM_STEPS",
         base_grad_accum_steps,
     )
     stage1_lr_warmup_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage1_lr_warmup_steps", None),
-        "TASKAWARE_STAGE1_LR_WARMUP_STEPS",
+        getattr(config, "new_stage1_lr_warmup_steps", None),
+        "NEW_STAGE1_LR_WARMUP_STEPS",
         base_warmup_steps,
     )
     stage1_lr_peak = _resolve_float_setting(
-        getattr(config, "taskaware_stage1_lr_peak", None),
-        "TASKAWARE_STAGE1_LR_PEAK",
+        getattr(config, "new_stage1_lr_peak", None),
+        "NEW_STAGE1_LR_PEAK",
         base_peak_lr,
     )
     stage1_lr_decay_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage1_lr_decay_steps", None),
-        "TASKAWARE_STAGE1_LR_DECAY_STEPS",
+        getattr(config, "new_stage1_lr_decay_steps", None),
+        "NEW_STAGE1_LR_DECAY_STEPS",
         base_decay_steps,
     )
     stage1_lr_end = _resolve_float_setting(
-        getattr(config, "taskaware_stage1_lr_decay_lr", None),
-        "TASKAWARE_STAGE1_LR_DECAY_LR",
+        getattr(config, "new_stage1_lr_decay_lr", None),
+        "NEW_STAGE1_LR_DECAY_LR",
         base_end_lr,
     )
     stage23_lr_warmup_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage23_lr_warmup_steps", None),
-        "TASKAWARE_STAGE23_LR_WARMUP_STEPS",
+        getattr(config, "new_stage23_lr_warmup_steps", None),
+        "NEW_STAGE23_LR_WARMUP_STEPS",
         base_warmup_steps,
     )
     stage23_lr_peak = _resolve_float_setting(
-        getattr(config, "taskaware_stage23_lr_peak", None),
-        "TASKAWARE_STAGE23_LR_PEAK",
+        getattr(config, "new_stage23_lr_peak", None),
+        "NEW_STAGE23_LR_PEAK",
         base_peak_lr,
     )
     stage23_lr_decay_steps = _resolve_int_setting(
-        getattr(config, "taskaware_stage23_lr_decay_steps", None),
-        "TASKAWARE_STAGE23_LR_DECAY_STEPS",
+        getattr(config, "new_stage23_lr_decay_steps", None),
+        "NEW_STAGE23_LR_DECAY_STEPS",
         base_decay_steps,
     )
     stage23_lr_end = _resolve_float_setting(
-        getattr(config, "taskaware_stage23_lr_decay_lr", None),
-        "TASKAWARE_STAGE23_LR_DECAY_LR",
+        getattr(config, "new_stage23_lr_decay_lr", None),
+        "NEW_STAGE23_LR_DECAY_LR",
         base_end_lr,
     )
 
@@ -836,11 +806,15 @@ def train_loop(config: _config.TrainConfig):
         return 3
 
     def _stage_loss_weights(stage: int) -> tuple[float, float, float]:
+        # [COPILOT] Fixed objective schedule:
+        # stage1: ITC+ITM only
+        # stage2: Action + 0.5 * Align
+        # stage3: Action + 0.5 * Align + new_stage3_task_loss_coeff * (ITC+ITM)
         if stage == 1:
             return 0.0, 0.0, stage1_task_loss_coeff
         if stage == 2:
-            return 1.0, float(config.align_loss_coeff), 0.0
-        return 1.0, float(config.align_loss_coeff), stage3_task_loss_coeff
+            return 1.0, 0.5, 0.0
+        return 1.0, 0.5, stage3_task_loss_coeff
 
     def _stage_batch_and_accum(stage: int) -> tuple[int, int]:
         if stage == 1:
@@ -891,7 +865,7 @@ def train_loop(config: _config.TrainConfig):
         }
 
         for name, param in model_base.named_parameters():
-            bucket = "QFormer" if name.startswith("taskaware_") else "VLM"
+            bucket = "QFormer" if name.startswith("new_") else "VLM"
             n = param.numel()
             stats[bucket]["total"] += n
             if param.requires_grad:
@@ -920,25 +894,16 @@ def train_loop(config: _config.TrainConfig):
         vlm_train = stats["VLM"]["trainable"]
         align_train = stats["Align"]["trainable"]
         vggt_train = stats["VGGT"]["trainable"]
-        # [COPILOT] Q-Former core must remain frozen for all stages; only input adapters can train in stage 1/3.
-        model_base = _unwrap_module(model)
-        qformer_core_train = sum(
-            p.numel() for n, p in model_base.named_parameters() if n.startswith("taskaware_qformer.") and p.requires_grad
-        )
 
         if vggt_train != 0:
             raise RuntimeError(f"VGGT must stay frozen, but found {vggt_train} trainable params.")
-        if qformer_core_train != 0:
-            raise RuntimeError(
-                f"Q-Former core must stay frozen across all stages, but found {qformer_core_train} trainable params."
-            )
         if stage == 1:
             if vlm_train != 0 or align_train != 0:
                 raise RuntimeError(
                     f"Stage 1 requires VLM/Align frozen, but found VLM={vlm_train}, Align={align_train} trainable params."
                 )
             if q_train == 0:
-                raise RuntimeError("Stage 1 expects task-aware (QFormer bucket) trainable params, but found none.")
+                raise RuntimeError("Stage 1 expects new (QFormer bucket) trainable params, but found none.")
         elif stage == 2:
             if q_train != 0:
                 raise RuntimeError(f"Stage 2 requires QFormer frozen, but found {q_train} trainable params.")
@@ -1165,14 +1130,8 @@ def train_loop(config: _config.TrainConfig):
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(_to_device_with_dtype, observation)  # noqa: PLW2901, [COPILOT]
-            # [COPILOT] Stage 1 fast path: action/align losses are disabled, so avoid large action-tensor GPU transfers.
-            if action_loss_coeff > 0 or align_loss_coeff > 0:
-                actions = actions.to(torch.float32)  # noqa: PLW2901
-                actions = actions.to(device)  # noqa: PLW2901
-                model_actions = actions
-            else:
-                # [COPILOT] Keep only a tiny placeholder on-device for zero-loss tensor allocation.
-                model_actions = torch.zeros((actions.shape[0], 1, 1), dtype=torch.float32, device=device)
+            actions = actions.to(torch.float32)  # noqa: PLW2901
+            actions = actions.to(device)  # noqa: PLW2901
 
             # [COPILOT] Gradient accumulation context
             is_accum_step = (accum_step + 1) % grad_accum_steps != 0
@@ -1180,19 +1139,17 @@ def train_loop(config: _config.TrainConfig):
             if use_ddp and is_accum_step:
                 no_sync_ctx = contextlib.ExitStack()
                 no_sync_ctx.enter_context(model.no_sync())
-                # [COPILOT] Stage 1 does not use align branch; skip align-projector DDP no_sync to reduce overhead.
-                if align_loss_coeff > 0:
-                    no_sync_ctx.enter_context(align_projector.no_sync())
+                no_sync_ctx.enter_context(align_projector.no_sync())
 
             with no_sync_ctx:
                 # Forward pass (AMP) [COPILOT]
                 with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                     # [COPILOT] Skip ITC/ITM computation when task_loss_coeff is zero (stage 2) to save memory.
                     action_losses, align_loss, task_loss = model(
-                        observation, model_actions, vggt=vggt_model, align_proj=align_projector,
+                        observation, actions, vggt=vggt_model, align_proj=align_projector,
                         compute_task_loss=(task_loss_coeff > 0),
                         # [COPILOT] Stage-aware compute gating:
-                        # - stage 1: skip action/align forward entirely (coeff=0), train only task-aware branch.
+                        # - stage 1: skip action/align forward entirely (coeff=0), train only ITC+ITM branch.
                         # - stage 2/3: keep action/align forward enabled.
                         compute_action_loss=(action_loss_coeff > 0),
                         compute_align_loss=(align_loss_coeff > 0),

@@ -537,6 +537,10 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
+        # [COPILOT] Train-attn-only override: force pi05 language token budget to 48 for memory/runtime control.
+    if getattr(model_cfg, "pi05", False):
+        object.__setattr__(model_cfg, "max_token_len", 48)
+
     model = openpi.models_pytorch.pi0_align_pytorch.PI0Pytorch(model_cfg, config).to(device)
     vggt_model = VGGT(
         enable_camera=False,
