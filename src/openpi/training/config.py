@@ -486,6 +486,8 @@ class TrainConfig:
     # [COPILOT] Optional shared AlignProjector width overrides; defaults keep legacy align behavior.
     align_projector_hidden_dim: int | None = None
     align_projector_out_dim: int | None = None
+    # [COPILOT] Perceiver Resampler depth for VGGT token compression in perceiver alignment models.
+    perceiver_num_layers: int = 2
 
     align_loss_coeff: float = 0.0
     taskaware_loss_coeff: float = 1.0  # [COPILOT] Coefficient for task-aware auxiliary loss: ITC + ITM.
@@ -1112,6 +1114,53 @@ _CONFIGS = [
         lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         num_train_steps=35_000,
         save_interval=1000,
+        gradient_checkpointing=True,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    #############################################################################
+
+    # [COPILOT] pi05 perceiver config
+    #############################################################################
+    TrainConfig(
+        name="pi05_perceiver_libero_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_full_torch",
+        vggt_weight_path="./checkpoints/vggt",
+        vla_layers_align=12,
+        vggt_layers_align=-1,
+        pytorch_training_precision="float32", # [DEBUG]
+        
+        use_vggt_pe=True,
+        use_vlm_norm=True,
+        # [COPILOT] Use Flamingo-style Perceiver Resampler blocks instead of bilinear custom_pooling.
+        perceiver_num_layers=2,
+        align_loss_coeff=0.5,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        lora_enabled=True,
+        lora_rank=8,
+        lora_alpha=16.0,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        num_train_steps=20000,
+        save_interval=2000,
+        batch_size=32, # [COPILOT] Gradient accumulation is none
         gradient_checkpointing=True,
         ema_decay=None,
         wandb_enabled=True,
