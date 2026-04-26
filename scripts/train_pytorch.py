@@ -237,8 +237,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
 
         # save norm stats
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+        if norm_stats is not None:
+            if data_config.asset_id is not None:
+                _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+            else:
+                _normalize.save(tmp_ckpt_dir / "assets", norm_stats)
 
         # Atomically move temp directory to final location
         if final_ckpt_dir.exists():
@@ -487,9 +490,8 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    # [COPILOT] Train-attn-only override: force pi05 language token budget to 48 for memory/runtime control.
-    if getattr(model_cfg, "pi05", False):
-        object.__setattr__(model_cfg, "max_token_len", 48)
+    if getattr(model_cfg, "pi05", False) and config.pytorch_pi05_max_token_len_override is not None:
+        object.__setattr__(model_cfg, "max_token_len", config.pytorch_pi05_max_token_len_override)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
